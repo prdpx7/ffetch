@@ -167,14 +167,14 @@ def setup(skip_lightpanda, skip_config):
     elif click.confirm("\nadd ffetch instructions to ~/.claude/CLAUDE.md?", default=True):
         _install_agent_prompt()
 
+    _setup_claude_permission()
+
     click.echo("")
     click.echo("setup complete.")
     click.echo("")
     click.echo(f"  try it:       ffetch https://example.com")
     click.echo(f"  config:       ffetch config show")
     click.echo(f"  edit config:  $EDITOR {_user_config_path()}")
-    click.echo("")
-    click.echo("  to use with AI agents, just say: \"use ffetch <url> to fetch web pages\"")
 
 
 def _install_lightpanda():
@@ -243,3 +243,34 @@ def _install_agent_prompt():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(AGENT_PROMPT.lstrip())
         click.echo(f"[ok] agent prompt created: {path}")
+
+
+FFETCH_PERMISSION = "Bash(ffetch:*)"
+
+
+def _setup_claude_permission():
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return
+
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    allow = settings.get("permissions", {}).get("allow", [])
+    if FFETCH_PERMISSION in allow:
+        click.echo(f"[ok] claude permission already set")
+        return
+
+    if not click.confirm("\nallow `ffetch` in Claude Code settings.json?", default=True):
+        return
+
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    if "allow" not in settings["permissions"]:
+        settings["permissions"]["allow"] = []
+
+    settings["permissions"]["allow"].append(FFETCH_PERMISSION)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    click.echo(f"[ok] added {FFETCH_PERMISSION} to {settings_path}")
