@@ -1,0 +1,26 @@
+defaults:
+  tier_order: [fast, render, stealth]
+  timeout: 30
+  impersonate: chrome
+  html_size_threshold: 5000
+  lightpanda_bin: lightpanda
+  playwright_wait: networkidle
+  playwright_sleep: 1.0
+  stealth_sleep: 2.0
+
+  # blocked/js signals are loaded from ffetch/signals/*.txt
+  # override them here only if you need to customize per-config
+
+  extraction:
+    include_links: true
+    include_images: false
+    include_tables: true
+    favor_recall: true
+    fallback_extractor: readability
+
+cache:
+  enabled: false
+  dir: "~/.cache/ffetch"
+  ttl_seconds: 3600
+
+sites: []

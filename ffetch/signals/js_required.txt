@@ -1,0 +1,8 @@
+noscript
+you need to enable javascript
+this page requires javascript
+javascript is required
+<div id="root"></div>
+<div id="app"></div>
+<div id="__next"></div>
+<div id="__nuxt"></div>
