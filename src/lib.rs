@@ -29,3 +29,4 @@ pub mod youtube;
 pub mod arxiv;
 pub mod citations;
 pub mod fulltext;
+pub mod reading;

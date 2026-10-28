@@ -1023,6 +1023,64 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
 }
 
 #[test]
+fn search_read_uses_pmc_fulltext_once_across_query_variants() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    let server = Fixture::new(move |path| {
+        if path.starts_with("/rest/") {
+            counted.fetch_add(1, Ordering::Relaxed);
+            (200,"application/xml","<article><front><article-meta><article-id pub-id-type='pmcid'>PMC123</article-id><article-id pub-id-type='doi'>10.1000/article</article-id><title-group><article-title>Research body</article-title></title-group></article-meta></front><body><sec><p>Evidence beyond the abstract.</p></sec></body></article>".into())
+        } else {
+            assert!(path.starts_with("/search"));
+            (200,"application/json",json!({"hitCount":1,"resultList":{"result":[{"id":"1","source":"MED","doi":"10.1000/article","pmcid":"PMC123","title":"Metadata title","abstractText":"Abstract only"}]}}).to_string())
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "tendon",
+        "--sources",
+        "europepmc",
+        "--limit",
+        "1",
+        "--read",
+        "--no-store",
+    ])
+    .env("FFETCH_EUROPEPMC_SEARCH", server.url("search"))
+    .env("FFETCH_EUROPEPMC_FULLTEXT", server.url("rest"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    let items = run["items"].as_array().unwrap();
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(items.len(), 2);
+    let body = items
+        .iter()
+        .find(|r| r["content"]["full_text_retrieved"] == true)
+        .unwrap();
+    let metadata = items.iter().find(|r| r["source"] == "europepmc").unwrap();
+    assert!(
+        body["text"]
+            .as_str()
+            .unwrap()
+            .contains("beyond the abstract")
+    );
+    assert_eq!(body["native"]["discovered_from"], metadata["id"]);
+    assert_eq!(run["meta"]["read_coverage"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        run["meta"]["read_coverage"][0]["meta"]["selected_representation"],
+        "europepmc-jats"
+    );
+    assert_eq!(run["meta"]["http"]["requests_started"], 3);
+}
+
+#[test]
 fn fulltext_preserves_jats_body_tables_math_and_original_xml() {
     let xml = "<?xml version='1.0' encoding='UTF-8'?><!DOCTYPE article SYSTEM 'https://invalid.example/article.dtd'><article xmlns:m='http://www.w3.org/1998/Math/MathML' article-type='research-article'><front><article-meta><article-id pub-id-type='pmcid'>PMC123</article-id><article-id pub-id-type='doi'>10.1000/grip</article-id><title-group><article-title>Robot <italic>gripper</italic></article-title></title-group><abstract><p>Abstract only</p></abstract></article-meta></front><body><sec id='s1'><title>Methods</title><p id='p1'>Soft <bold>gripper</bold> &amp; control.</p><table-wrap id='t1'><table><tr><th>Torque</th></tr><tr><td colspan='2'>4 N m</td></tr></table></table-wrap><disp-formula><m:math><m:mi>x</m:mi></m:math></disp-formula></sec></body><back><ref-list><ref id='r1'><mixed-citation>Source reference</mixed-citation></ref></ref-list></back></article>";
     let server = Fixture::new(move |_| (200, "application/xml", xml.into()));

@@ -127,7 +127,15 @@ date parts. The original XML is saved as an artifact unless `--no-store` is used
 DTD files are never loaded, and internal entity declarations are rejected.
 MathML layout and images are not fully represented in the text output. This
 command does not parse PDFs; unavailable or restricted XML returns a structured
-failure. Search `--read` does not yet select this representation automatically.
+failure.
+
+Search `--read` selects JATS when a result exposes a PMCID or a supported PMC
+article URL. Repeated discoveries share one full-text retrieval. Later metadata
+with a PMCID can upgrade an earlier ordinary page read. When an explicit DOI is
+available, the XML must also establish that DOI before being linked to the search
+result. A failed JATS retrieval can fall back to ordinary HTTP/browser/archive
+retrieval, keeping partial status and marking full-text completeness unverified.
+`meta.read_coverage` records the chosen representation and any errors.
 
 ```sh
 ffetch references '10.1038/nphys1170' --depth 2 --limit 20

@@ -729,32 +729,34 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
             drop(progress);
             let mut searches = stream::iter(tasks).buffer_unordered(cli.concurrency);
             let mut documents = futures::stream::FuturesUnordered::new();
-            let mut targets: std::collections::VecDeque<(String, String)> =
+            let mut targets: std::collections::VecDeque<ffetch::reading::Target> =
                 std::collections::VecDeque::new();
-            let mut seen = std::collections::HashSet::new();
+            let mut read_plan = ffetch::reading::Planner::default();
             let mut coverage = Vec::new();
             let mut searching = true;
             let mut receiving_pages = stream_pages;
             let mut received_ids = std::collections::HashSet::new();
             loop {
                 while documents.len() < cli.concurrency {
-                    let Some((parent, url)) = targets.pop_front() else {
+                    let Some(target) = targets.pop_front() else {
                         break;
                     };
                     let fetcher = &fetcher;
                     let providers = &providers;
                     documents.push(
                         async move {
-                            let fetched = if let Some(id) = ffetch::arxiv::paper_id(&url) {
+                            let fetched = if target.pmcid.is_some() {
+                                ffetch::reading::fulltext_read(fetcher, &target).await
+                            } else if let Some(id) = ffetch::arxiv::paper_id(&target.url) {
                                 providers.arxiv_paper(&id).await
-                            } else if let Some(id) = ffetch::youtube::video_id(&url) {
+                            } else if let Some(id) = ffetch::youtube::video_id(&target.url) {
                                 providers.youtube_video(&id, None).await
                             } else {
                                 fetcher
-                                    .fetch(&url, &Options::default(), Archive::Auto)
+                                    .fetch(&target.url, &Options::default(), Archive::Auto)
                                     .await
                             };
-                            (parent, fetched)
+                            (target.parent, fetched)
                         }
                         .boxed_local(),
                     );
@@ -778,6 +780,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                     }
                     document = documents.next(), if !documents.is_empty() => {
                         if let Some((parent, mut fetched)) = document {
+                            run.meta["read_coverage"].as_array_mut().map(|entries|entries.push(json!({"parent":parent,"status":fetched.status,"meta":fetched.meta,"errors":fetched.errors}))).unwrap_or_else(||run.meta["read_coverage"]=json!([{"parent":parent,"status":fetched.status,"meta":fetched.meta,"errors":fetched.errors}]));
                             for record in &mut fetched.items {
                                 if !record.native.is_object() { record.native = json!({}); }
                                 record.native["discovered_from"] = json!(parent);
@@ -804,14 +807,8 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                 if *read {
                     for index in changed {
                         let record = &run.items[index];
-                        let url = record.content["article_url"]
-                            .as_str()
-                            .unwrap_or(&record.url);
-                        if seen.insert(
-                            ffetch::research::identity(record)
-                                .unwrap_or_else(|| extract::canonical(url)),
-                        ) {
-                            targets.push_back((record.id.clone(), url.to_owned()));
+                        if let Some(target) = read_plan.consider(record) {
+                            targets.push_back(target);
                         }
                     }
                 }
@@ -1111,6 +1108,9 @@ fn output(cli: &Cli, query: &query::Query, mut value: Value) -> Result<()> {
                         if let Some(depth) = item["native"]["citation_depth"].as_u64() {
                             writeln!(out, "Citation depth: {depth}")?;
                         }
+                        if item["native"]["fulltext_fallback"] == true {
+                            writeln!(out, "[Fallback: full-text completeness unverified]")?;
+                        }
                         if let Some(origins) = item["native"]["origins"].as_array() {
                             let engines = origins
                                 .iter()
@@ -1234,7 +1234,7 @@ fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
         "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
-        "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":false},
+        "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":true,"trigger":"PMCID metadata or supported PMC URL","doi_assertion_check":true},
         "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},
         "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
         "http":{"global_concurrency_default":8,"origin_concurrency_default":4,"origin_flag":"--origin-concurrency","attempt_timeout_seconds":15,"redirect_limit":10,"redirect_origin_limits":true,"retry_after":{"statuses":[429,503],"max_retries_per_get":1,"valid_header_required":true,"remaining_budget":true,"redirect_delays":true,"cross_process_coordination":false},"telemetry":"meta.http","browser_network_scheduled":false},
