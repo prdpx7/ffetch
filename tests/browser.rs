@@ -36,6 +36,9 @@ impl Site {
                         let static_page = buffer[..n].starts_with(b"GET /static ");
                         let html = "<!doctype html><title>Browser fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=`<article style='min-height:1600px'><h1>Robot fixture ready</h1><label>Name <input id='name'></label><button onclick=\"document.querySelector('#answer').textContent='Hello '+document.querySelector('#name').value\">Run</button><p id='answer'></p></article>`},100)</script>";
                         let engine_page = buffer[..n].starts_with(b"GET /engine?");
+                        let attribute_page = buffer[..n].starts_with(b"GET /attribute ");
+                        let redirect_page = buffer[..n].starts_with(b"GET /redirect ");
+                        let missing_page = buffer[..n].starts_with(b"GET /missing ");
                         let html = if engine_page
                             && String::from_utf8_lossy(&buffer[..n]).contains("start=10")
                         {
@@ -44,12 +47,19 @@ impl Site {
                             "<!doctype html><title>Search fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=\"<div class='MjjYud'><a href='https://example.org/robot'><h3>Robot research</h3></a><div class='VwiC3b'>Validated engine evidence</div></div><a id='pnnext' href='/engine?q=robotics&amp;start=10'>Next</a>\"},100)</script>"
                         } else if static_page {
                             "<article>Static robot document</article>"
+                        } else if attribute_page {
+                            "<!doctype html><article id='state' data-state='waiting'>Attribute fixture</article><script>setTimeout(()=>document.querySelector('#state').dataset.state='ready',100)</script>"
+                        } else if redirect_page {
+                            "<!doctype html><script>setTimeout(()=>location.replace('/missing'),30)</script>"
+                        } else if missing_page {
+                            "<!doctype html><article>Missing robot document</article>"
                         } else {
                             html
                         };
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {} Fixture\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            if missing_page { 404 } else { 200 },
                             html.len(),
                             html
                         );
@@ -80,20 +90,20 @@ struct Browser {
 }
 impl Browser {
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ffetch"));
+        let mut command = Command::new(
+            std::env::var_os("FFETCH_BENCH_BROWSER_BIN")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_ffetch").into()),
+        );
         command
             .args(args)
-            .args([
-                "--no-store",
-                "--timeout",
-                "15",
-                "--browser-path",
-                &self.executable,
-            ])
+            .args(["--no-store", "--browser-path", &self.executable])
             .arg("--data-dir")
             .arg(self.directory.path())
             .env("NO_PROXY", "localhost,127.0.0.1")
             .env("no_proxy", "localhost,127.0.0.1");
+        if !args.contains(&"--timeout") {
+            command.args(["--timeout", "15"]);
+        }
         if std::env::var_os("FFETCH_TEST_BROWSER_NO_SANDBOX").is_some() {
             command.arg("--browser-no-sandbox");
         }
@@ -121,6 +131,54 @@ impl Drop for Browser {
             .args(["--session", "test"])
             .output();
     }
+}
+
+#[test]
+#[ignore = "controlled browser latency benchmark; set FFETCH_TEST_BROWSER and FFETCH_BENCH_BROWSER_BIN"]
+fn benchmark_browser_navigation_readiness() {
+    let browser = Browser {
+        directory: tempfile::tempdir().unwrap(),
+        executable: std::env::var("FFETCH_TEST_BROWSER").expect("set FFETCH_TEST_BROWSER"),
+    };
+    let site = Site::new();
+    browser.run(&["browser", "start"]);
+    let mut measurements = serde_json::Map::new();
+    for (name, url, selector, expected) in [
+        (
+            "static",
+            format!("{}static", site.url),
+            "article",
+            "Static robot document",
+        ),
+        (
+            "javascript_100ms",
+            site.url.clone(),
+            "#name",
+            "Robot fixture ready",
+        ),
+    ] {
+        let mut samples = Vec::new();
+        for _ in 0..12 {
+            let began = std::time::Instant::now();
+            let result = browser.run(&["browser", "open", &url, "--wait-for", selector]);
+            samples.push(began.elapsed().as_secs_f64() * 1000.0);
+            assert!(
+                result["items"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected)
+            );
+            assert_eq!(result["meta"]["http_status"], 200);
+        }
+        samples.sort_by(f64::total_cmp);
+        let median = (samples[samples.len() / 2 - 1] + samples[samples.len() / 2]) / 2.0;
+        measurements.insert(name.into(),serde_json::json!({"samples_ms":samples,"p50_ms":median,"p95_ms":samples[samples.len()-1]}));
+    }
+    let result = serde_json::json!({"benchmark":"warm browser session, separate CLI invocations; localhost","binary":std::env::var("FFETCH_BENCH_BROWSER_BIN").ok(),"browser":browser.executable,"platform":std::env::consts::OS,"samples_per_case":12,"p50":"median of two middle observations","p95":"nearest rank","measurements":measurements});
+    if let Some(path) = std::env::var_os("FFETCH_BENCH_BROWSER_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    }
+    println!("{result}");
 }
 
 #[test]
@@ -244,6 +302,68 @@ fn automatic_rendering_is_lazy_and_recovers_a_javascript_shell() {
             .as_str()
             .unwrap()
             .contains("Robot fixture ready")
+    );
+}
+
+#[test]
+fn readiness_observes_attributes_redirects_and_missing_selectors() {
+    let Ok(executable) = std::env::var("FFETCH_TEST_BROWSER") else {
+        return;
+    };
+    let browser = Browser {
+        directory: tempfile::tempdir().unwrap(),
+        executable,
+    };
+    let site = Site::new();
+    let attribute = browser.run(&[
+        "browser",
+        "open",
+        &format!("{}attribute", site.url),
+        "--wait-for",
+        "[data-state='ready']",
+    ]);
+    assert!(
+        attribute["items"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Attribute fixture")
+    );
+    let redirected = browser.run(&[
+        "browser",
+        "open",
+        &format!("{}redirect", site.url),
+        "--wait-for",
+        "article",
+    ]);
+    assert_eq!(
+        redirected["items"][0]["url"],
+        format!("{}missing", site.url)
+    );
+    assert_eq!(redirected["meta"]["http_status"], 404);
+    assert_eq!(redirected["meta"]["http_status_observed"], true);
+    let missing = browser
+        .command(&[
+            "browser",
+            "open",
+            &format!("{}static", site.url),
+            "--wait-for",
+            "#never-exists",
+            "--timeout",
+            "1",
+        ])
+        .args(["--session", "test"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["status"], "error");
+    assert!(!missing["errors"].as_array().unwrap().is_empty());
+    let recovered = browser.run(&["browser", "open", &format!("{}static", site.url)]);
+    assert!(
+        recovered["items"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Static robot document")
     );
 }
 

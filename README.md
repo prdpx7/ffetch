@@ -284,6 +284,17 @@ eligible HTTP or parsing failures.
 an executable with `--browser-path` or `FFETCH_BROWSER_PATH`. Browser installation
 is separate. Rendered DOM artifacts are labeled separately from HTTP responses.
 
+Navigation waits for the document to commit, then for visible body text or the
+selector given to `browser open --wait-for`. Document and mutation events drive
+readiness. Use a selector when a page loads the content you need after its initial
+text. Later application updates can still occur after the selected condition.
+Client-side redirects retain the final document's observed HTTP status.
+
+Automatic renders use separate temporary contexts for cookies and storage.
+Completed, cancelled, or timed-out renders close those contexts and their tabs.
+Use a named `--session` to keep authentication and page state between commands.
+Named sessions stay open until `browser stop`.
+
 If Chromium cannot start, ffetch reports `browser_unavailable` with a startup
 diagnosis. Automatic rendering shares startup failures across providers in the
 current run, avoiding repeated launches after a failed startup.

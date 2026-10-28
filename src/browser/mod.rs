@@ -103,6 +103,155 @@ pub struct Rendered {
     pub status_observed: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_status_follows_committed_main_frame_revisions() {
+        let mut navigation = Navigation {
+            loader: "first".into(),
+            frame: "main".into(),
+            committed: false,
+            status: None,
+            pending_status: None,
+            generation: 0,
+        };
+        navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"stale"}}}));
+        assert!(!navigation.committed);
+        for (frame, loader, status) in [("subframe", "first", 500), ("main", "first", 200)] {
+            navigation.observe(&json!({"method":"Network.responseReceived","params":{"type":"Document","frameId":frame,"loaderId":loader,"response":{"status":status}}}));
+        }
+        navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"first"}}}));
+        assert!(navigation.committed);
+        assert_eq!(navigation.status, Some(200));
+        navigation.observe(&json!({"method":"Network.responseReceived","params":{"type":"Document","frameId":"main","loaderId":"redirect","response":{"status":404}}}));
+        assert_eq!(navigation.status, Some(200));
+        navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"redirect"}}}));
+        assert_eq!(navigation.status, Some(404));
+        assert_eq!(navigation.generation, 2);
+        navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"unknown-status"}}}));
+        assert_eq!(navigation.status, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_ephemeral_render_disposes_its_context_and_reuses_the_browser() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(executable) = std::env::var("FFETCH_TEST_BROWSER") else {
+            return;
+        };
+        let site = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = site.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = site.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await
+                else {
+                    continue;
+                };
+                let body = if request[..n].starts_with(b"GET /waiting ") {
+                    "<!doctype html><body></body>"
+                } else {
+                    "<!doctype html><article>Reusable browser</article>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let renderer = Renderer::new(
+            Config {
+                root: directory.path().to_owned(),
+                executable: Some(executable.into()),
+                timeout: Duration::from_secs(5),
+                max_bytes: 1024 * 1024,
+                no_sandbox: std::env::var_os("FFETCH_TEST_BROWSER_NO_SANDBOX").is_some(),
+            },
+            None,
+            None,
+        );
+        let normal = Url::parse(&format!("http://{address}/ready")).unwrap();
+        renderer.render(&normal).await.unwrap();
+        let endpoint = {
+            let state = renderer.runtime.lock().await;
+            let RuntimeState::Running(runtime) = &*state else {
+                panic!("browser is not running");
+            };
+            runtime.endpoint.clone()
+        };
+        let mut observer = Cdp::connect(&endpoint, Duration::from_secs(2), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            observer
+                .call("Target.getBrowserContexts", json!({}))
+                .await
+                .unwrap()["browserContextIds"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let waiting = Url::parse(&format!("http://{address}/waiting")).unwrap();
+        let mut cancelled = Box::pin(renderer.render(&waiting));
+        let started = async {
+            loop {
+                let targets = observer.call("Target.getTargets", json!({})).await.unwrap();
+                if targets["targetInfos"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["url"] == waiting.as_str())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut cancelled => panic!("readiness should remain pending; error: {:?}",result.err().map(|e|e.to_string())),
+            result = tokio::time::timeout(Duration::from_secs(2),started) => result.unwrap(),
+        }
+        drop(cancelled);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let contexts = observer
+                    .call("Target.getBrowserContexts", json!({}))
+                    .await
+                    .unwrap();
+                let targets = observer.call("Target.getTargets", json!({})).await.unwrap();
+                let owned_target_remains =
+                    targets["targetInfos"].as_array().unwrap().iter().any(|t| {
+                        t["url"]
+                            .as_str()
+                            .is_some_and(|url| url.starts_with(&format!("http://{address}/")))
+                    });
+                if contexts["browserContextIds"].as_array().unwrap().is_empty()
+                    && !owned_target_remains
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled render leaked its context");
+        let rendered = renderer.render(&normal).await.unwrap();
+        assert!(
+            String::from_utf8(rendered.response.bytes)
+                .unwrap()
+                .contains("Reusable browser")
+        );
+        let state = renderer.runtime.lock().await;
+        assert!(matches!(&*state, RuntimeState::Running(runtime) if runtime.endpoint == endpoint));
+        server.abort();
+    }
+}
+
 impl Config {
     pub fn executable(&self) -> Option<PathBuf> {
         session::discover(self.executable.as_deref())
@@ -511,10 +660,24 @@ pub async fn navigate(
     wait_for: Option<&str>,
     max_bytes: usize,
 ) -> Result<Rendered> {
+    net::within_budget(
+        cdp.timeout(),
+        navigate_document(cdp, url, wait_for, max_bytes),
+    )
+    .await
+    .context("browser navigation deadline exceeded")?
+}
+
+async fn navigate_document(
+    cdp: &mut Cdp,
+    url: &Url,
+    wait_for: Option<&str>,
+    max_bytes: usize,
+) -> Result<Rendered> {
     if let Some(css) = wait_for {
         extract::selector(css)?;
     }
-    cdp.events.clear();
+    cdp.drain_events()?;
     let result = cdp
         .call("Page.navigate", json!({"url":url.as_str()}))
         .await?;
@@ -523,52 +686,121 @@ pub async fn navigate(
         "browser navigation failed: {}",
         result["errorText"]
     );
-    let loader = result["loaderId"].as_str().unwrap_or("").to_owned();
-    let frame = result["frameId"].as_str().unwrap_or("").to_owned();
-    let mut committed = loader.is_empty();
-    let mut status = None;
-    let warnings = vec![];
-    let ready = if let Some(css) = wait_for {
-        format!(
-            "document.readyState !== 'loading' && !!document.querySelector({})",
-            serde_json::to_string(css)?
-        )
-    } else {
-        "document.readyState !== 'loading' && !!document.body && document.body.innerText.trim().length > 0".into()
+    let mut navigation = Navigation {
+        loader: result["loaderId"].as_str().unwrap_or("").into(),
+        frame: result["frameId"]
+            .as_str()
+            .context("browser returned no navigation frame")?
+            .into(),
+        committed: result["loaderId"].as_str().is_none_or(str::is_empty),
+        status: None,
+        pending_status: None,
+        generation: 0,
     };
+    // Wait in an isolated world for the requested DOM condition. Mutation and
+    // document events resolve immediately; no readiness polling floor is added.
+    let ready = include_str!("scripts/ready.js")
+        .replace(
+            "TIMEOUT_MS",
+            &cdp.timeout().as_millis().min(i32::MAX as u128).to_string(),
+        )
+        .replace("WAIT_FOR", &serde_json::to_string(&wait_for)?);
     loop {
-        let was_committed = committed;
-        let is_ready = cdp.evaluate(&ready, None).await.unwrap_or(json!(false)) == true;
-        while let Some(event) = cdp.events.pop_front() {
-            let p = &event["params"];
-            match event["method"].as_str().unwrap_or("") {
-                "Page.frameNavigated"
-                    if p["frame"]["id"] == frame
-                        && (loader.is_empty() || p["frame"]["loaderId"] == loader) =>
-                {
-                    committed = true;
+        for event in cdp.drain_events()? {
+            navigation.observe(&event);
+        }
+        if !navigation.committed {
+            navigation.observe(&cdp.next_event().await?);
+            continue;
+        }
+        let generation = navigation.generation;
+        let extracted = async {
+            let context = cdp.isolated_world().await?;
+            cdp.evaluate(&ready, Some(context)).await?;
+            document(cdp, max_bytes, navigation.status).await
+        }
+        .await;
+        for event in cdp.drain_events()? {
+            navigation.observe(&event);
+        }
+        let mut response = match extracted {
+            Ok(_) if generation != navigation.generation => continue,
+            Ok(response) => response,
+            Err(error) if context_was_replaced(&error) => {
+                // Client-side redirects can destroy a readiness promise. Await
+                // the replacement document; never repeat the navigation/action.
+                while generation == navigation.generation {
+                    navigation.observe(&cdp.next_event().await?);
                 }
-                "Network.responseReceived"
-                    if p["type"] == "Document"
-                        && p["frameId"] == frame
-                        && (loader.is_empty() || p["loaderId"] == loader) =>
-                {
-                    status = p["response"]["status"].as_f64().map(|s| s as u16);
-                }
-                _ => (),
+                continue;
             }
+            Err(error) => return Err(error),
+        };
+        if let Some(status) = navigation.status {
+            response.status = reqwest::StatusCode::from_u16(status)?;
         }
-        if is_ready && was_committed {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        return Ok(Rendered {
+            response,
+            warnings: vec![],
+            status_observed: navigation.status.is_some(),
+        });
     }
-    let response = document(cdp, max_bytes, status).await?;
-    Ok(Rendered {
-        response,
-        warnings,
-        status_observed: status.is_some(),
-    })
+}
+
+fn context_was_replaced(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    [
+        "Execution context was destroyed",
+        "Cannot find context with specified id",
+        "Cannot find context with specified unique id",
+        "Inspected target navigated or closed",
+    ]
+    .iter()
+    .any(|part| message.contains(part))
+}
+
+struct Navigation {
+    loader: String,
+    frame: String,
+    committed: bool,
+    status: Option<u16>,
+    pending_status: Option<(String, u16)>,
+    generation: u64,
+}
+
+impl Navigation {
+    fn observe(&mut self, event: &Value) {
+        let params = &event["params"];
+        match event["method"].as_str() {
+            Some("Page.frameNavigated")
+                if params["frame"]["id"] == self.frame
+                    && (self.committed || params["frame"]["loaderId"] == self.loader) =>
+            {
+                self.committed = true;
+                self.loader = params["frame"]["loaderId"].as_str().unwrap_or("").into();
+                self.generation += 1;
+                self.status = self
+                    .pending_status
+                    .as_ref()
+                    .filter(|(loader, _)| loader == &self.loader)
+                    .map(|(_, status)| *status);
+            }
+            Some("Network.responseReceived")
+                if params["type"] == "Document" && params["frameId"] == self.frame =>
+            {
+                if let (Some(loader), Some(status)) = (
+                    params["loaderId"].as_str(),
+                    params["response"]["status"].as_f64(),
+                ) {
+                    self.pending_status = Some((loader.into(), status as u16));
+                    if loader == self.loader {
+                        self.status = Some(status as u16);
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
 }
 
 struct Runtime {
@@ -606,6 +838,12 @@ impl Renderer {
         self.session.is_some() || self.config.executable().is_some()
     }
     pub async fn render(&self, url: &Url) -> Result<Rendered> {
+        net::within_budget(self.config.timeout, self.render_document(url))
+            .await
+            .context("browser render deadline exceeded")?
+    }
+
+    async fn render_document(&self, url: &Url) -> Result<Rendered> {
         let _permit = self.permits.acquire().await?;
         if let Some(name) = &self.session {
             let session = Session::lock(&self.config.root, name, self.config.timeout).await?;
@@ -656,29 +894,43 @@ impl Renderer {
             }
         };
         let mut cdp = Cdp::connect(&endpoint, self.config.timeout, self.config.max_bytes).await?;
+        // Chromium owns cleanup even when this future is cancelled before it
+        // can issue a close command. Independent renders also isolate cookies.
+        let context = cdp
+            .call(
+                "Target.createBrowserContext",
+                json!({"disposeOnDetach":true}),
+            )
+            .await?;
+        let context = context["browserContextId"]
+            .as_str()
+            .context("missing temporary browser context")?
+            .to_owned();
         let target = cdp
-            .call("Target.createTarget", json!({"url":"about:blank"}))
+            .call(
+                "Target.createTarget",
+                json!({"url":"about:blank","browserContextId":context}),
+            )
             .await?;
         let target = target["targetId"]
             .as_str()
             .context("missing target")?
             .to_owned();
         cdp.attach(&target).await?;
-        let result = tokio::time::timeout(
-            self.config.timeout,
-            navigate(
-                &mut cdp,
-                url,
-                self.wait_for.as_deref(),
-                self.config.max_bytes,
-            ),
+        let result = navigate(
+            &mut cdp,
+            url,
+            self.wait_for.as_deref(),
+            self.config.max_bytes,
         )
-        .await
-        .context("browser navigation deadline exceeded");
+        .await;
         cdp.session = None;
         let _ = cdp
-            .call("Target.closeTarget", json!({"targetId":target}))
+            .call(
+                "Target.disposeBrowserContext",
+                json!({"browserContextId":context}),
+            )
             .await;
-        result?
+        result
     }
 }
