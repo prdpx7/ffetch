@@ -88,6 +88,26 @@ pub async fn fulltext_read(fetcher: &Fetcher, target: &Target) -> Run {
     run
 }
 
+pub async fn arxiv_read(fetcher: &Fetcher, input: &str) -> Run {
+    match crate::arxiv::pdf_url(input) {
+        Ok(url) => {
+            let mut run = fetcher
+                .fetch(url.as_str(), &Options::default(), Archive::Auto)
+                .await;
+            run.meta["arxiv_id"] = json!(crate::arxiv::paper_id(input));
+            run.meta["discovered_url"] = json!(input);
+            run
+        }
+        Err(error) => {
+            let mut run = Run::new("fetch");
+            run.errors
+                .push(Issue::new("arxiv", "pdf_url_invalid", error.to_string()));
+            run.finish(0);
+            run
+        }
+    }
+}
+
 async fn finish_read(fetcher: &Fetcher, target: &Target, run: &mut Run) {
     if !run.items.is_empty() {
         if let Some(expected) = &target.expected_doi {
@@ -171,6 +191,7 @@ mod tests {
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         });
         let fetcher = Fetcher {
+            pdf_worker: None,
             http: crate::net::Http::new(Duration::from_secs(2), 4096, 2).unwrap(),
             browser: None,
             browser_mode: crate::browser::Mode::Off,

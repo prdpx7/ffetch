@@ -170,6 +170,21 @@ pub fn paper_id(input: &str) -> Option<String> {
     };
     valid.then_some(value)
 }
+
+/// Use the discovered version directly instead of repeating an Atom lookup.
+pub fn pdf_url(input: &str) -> Result<Url> {
+    let id = paper_id(input).context("invalid arXiv paper identifier")?;
+    let mut base = crate::net::normalize(
+        &std::env::var("FFETCH_ARXIV_PDF_BASE").unwrap_or_else(|_| "https://arxiv.org/pdf/".into()),
+    )?;
+    ensure!(
+        base.query().is_none() && base.fragment().is_none(),
+        "arXiv PDF base must not have a query or fragment"
+    );
+    let path = format!("{}/{}", base.path().trim_end_matches('/'), id);
+    base.set_path(&path);
+    Ok(base)
+}
 fn entry(node: &Node) -> Result<Record> {
     let original = node
         .value(ATOM, "id")

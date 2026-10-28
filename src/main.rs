@@ -471,6 +471,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
     };
     let renderer = Renderer::new(browser_config.clone(), cli.session.clone(), None);
     let fetcher = Fetcher {
+        pdf_worker: Some(std::env::current_exe()?),
         http: http.clone(),
         browser: (cli.browser != browser::Mode::Off).then_some(renderer.clone()),
         browser_mode: cli.browser,
@@ -603,7 +604,8 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                         .ok()
                         .and_then(|url| providers::hn_id(&url));
                     if let Some(id) = ffetch::arxiv::paper_id(url).filter(|_| {
-                        options.css.is_none()
+                        !net::normalize(url).is_ok_and(|url| url.path().starts_with("/pdf/"))
+                            && options.css.is_none()
                             && matches!(options.mode, Extract::Article)
                             && args.archive != Archive::LatestValid
                     }) {
@@ -787,8 +789,8 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                         async move {
                             let fetched = if target.pmcid.is_some() {
                                 ffetch::reading::fulltext_read(fetcher, &target).await
-                            } else if let Some(id) = ffetch::arxiv::paper_id(&target.url) {
-                                providers.arxiv_paper(&id).await
+                            } else if ffetch::arxiv::paper_id(&target.url).is_some() {
+                                ffetch::reading::arxiv_read(fetcher, &target.url).await
                             } else if let Some(id) = ffetch::youtube::video_id(&target.url) {
                                 providers.youtube_video(&id, None).await
                             } else {
@@ -1273,8 +1275,8 @@ fn write_csv(out: &mut impl Write, value: &Value) -> Result<()> {
 fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
-        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
-        "pdf":{"command":"pdf","parser":"lopdf 0.46","external_runtime":false,"isolated_worker":true,"unix_address_space_limit_bytes":536870912,"default_pages":20,"maximum_pages":500,"ocr":false,"layout_verified":false,"automatic_fetch":false},
+        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":true,"search_read":"versioned PDF; no repeated Atom lookup"},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "pdf":{"command":"pdf","parser":"lopdf 0.46","external_runtime":false,"isolated_worker":true,"unix_address_space_limit_bytes":536870912,"default_pages":20,"maximum_pages":500,"ocr":false,"layout_verified":false,"automatic_fetch":true,"automatic_modes":["article","text"],"detection":"response signature or MIME type; not URL suffix","single_download":true,"reuse_stored_artifact":true,"search_read_automatic":true},
         "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":true,"trigger":"PMCID metadata or supported PMC URL","doi_assertion_check":true},
         "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},
         "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
@@ -1286,7 +1288,7 @@ fn capabilities() -> Value {
         "formats":["json","jsonl","text","markdown","csv"],
         "exit_codes":{"0":"success (possibly an empty result)","1":"retrieval/provider failure","2":"usage/query/storage failure","3":"partial results"},
         "sampling":{"algorithm":"reservoir-r","seeded":true,"stage":"output records after retrieval; full saved run retained","constant_memory_whole_operation":false},
-        "limitations":["HTTP transport currently uses reqwest without browser impersonation","Browser rendering requires optional Chrome/Chromium; CAPTCHA/session/network restrictions can still prevent retrieval","Additional social/scientific sources and archive providers are planned; Crossref and Europe PMC metadata search are available","PDF/OCR/audio/CAD semantic parsers are not implemented; original bytes can be retained","Trend output is a platform ranking, not measured momentum","JSONL streams completed targets/sources without whole-run queries; providers may still collect internally","No guarantee of universal access or globally newest archive capture"],
+        "limitations":["HTTP transport currently uses reqwest without browser impersonation","Browser rendering requires optional Chrome/Chromium; CAPTCHA/session/network restrictions can still prevent retrieval","Additional social/scientific sources and archive providers are planned; Crossref and Europe PMC metadata search are available","PDF text layers are supported; OCR, audio and CAD semantic parsers are not implemented","Trend output is a platform ranking, not measured momentum","JSONL streams completed targets/sources without whole-run queries; providers may still collect internally","No guarantee of universal access or globally newest archive capture"],
         "storage":"HTTP/DOM artifacts addressed by SHA-256; runs addressed by UUID; --no-store disables evidence writes, not browser profile/session state"
     })
 }

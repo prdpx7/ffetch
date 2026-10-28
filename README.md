@@ -129,8 +129,12 @@ Extraction uses an embedded Rust parser in a child process of the same binary.
 The retrieval/extraction deadline cancels that process. Unix workers have a
 512 MiB address-space limit; streams and output also have byte limits. The
 Windows memory limit is not implemented. Password-protected PDFs are unsupported.
-No separate PDF tool is required. `fetch` and `search --read` do not yet choose
-this PDF extractor automatically.
+No separate PDF tool is required. `fetch` with article or text extraction and
+`search --read` select this parser when response bytes or the MIME type identify
+a PDF. This works without a `.pdf` URL suffix. Each document is downloaded once;
+workers reuse the saved artifact when storage is enabled. Automatic reads return
+up to the first 20 pages. Use `pdf --page N --limit N` to select another range.
+CSS selectors and HTML, JSON, links, or tables extraction are unsupported for PDFs.
 
 ```sh
 ffetch fulltext PMC11762333
@@ -174,7 +178,7 @@ may remain unresolved. Output is collected until traversal completes.
 | `hn` | Search, feeds, stories, bounded comment trees |
 | `reddit` | Community search, feeds, posts, bounded comment trees |
 | `youtube` | Video search, metadata, available captions, API popular rankings |
-| `arxiv` | Preprint search, versioned metadata, abstracts, categories, PDF links |
+| `arxiv` | Preprint search, versioned metadata, abstracts, categories, PDF text |
 | `crossref` | DOI metadata, available abstracts, references, resource links |
 | `europepmc` | Publication metadata, available abstracts, full-text links |
 | `pubmed` | PubMed-indexed records through Europe PMC |
@@ -197,8 +201,10 @@ ffetch search 'cat:cs.RO AND all:gripper' --sources arxiv --limit 10
 ffetch fetch https://arxiv.org/abs/2501.12345v2
 ```
 
-arXiv search supports field queries and pagination. URL fetching returns versioned
-metadata and the abstract, not parsed PDF content. Requests to its API are
+arXiv search supports field queries and pagination. Fetching an `/abs/` URL returns
+versioned metadata and the abstract. Fetching a `/pdf/` URL extracts PDF pages.
+Search `--read` fetches the PDF for each discovered version without another
+metadata lookup. Requests to its API are
 serialized at three-second intervals within one process. Avoid parallel arXiv
 CLI processes; cross-process rate coordination is not implemented.
 
@@ -313,7 +319,7 @@ markup and can be blocked independently of the initial page. Browser support has
 been tested on controlled local pages.
 Live caption retrieval and authenticated platform access need broader validation.
 
-X search, PDF/OCR extraction, measured trends, and prompt-injection detection are
+X search, OCR, measured trends, and prompt-injection detection are
 not implemented. Retrieved content is
 untrusted source data. Use `ffetch capabilities` to inspect the operations
 exposed by a build.

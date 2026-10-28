@@ -1,14 +1,18 @@
 use crate::{
     browser::{Mode, Renderer},
-    extract::{self, Options},
+    extract::{self, Extract, Options},
     model::{Attempt, Issue, Run},
     net::{self, Http, Response},
+    pdf,
     store::Store,
 };
 use anyhow::{Result, anyhow, ensure};
 use clap::ValueEnum;
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq)]
@@ -29,6 +33,8 @@ pub struct Fetcher {
     pub cdx: Url,
     pub replay: Url,
     pub archive_limit: usize,
+    /// Path to ffetch itself, not a library host's current executable.
+    pub pdf_worker: Option<PathBuf>,
 }
 
 impl Fetcher {
@@ -75,7 +81,7 @@ impl Fetcher {
         if archive != Archive::LatestValid && !forced {
             let start = Instant::now();
             match self.http.get(url.clone()).await.and_then(validate) {
-                Ok(response) => match self.ingest(&response, options, None, run) {
+                Ok(response) => match self.ingest(response, options, None, run).await {
                     Ok(()) => {
                         record_attempt(run, "http", url, "ok", start);
                         return;
@@ -114,12 +120,16 @@ impl Fetcher {
                     Ok(Ok(rendered)) => {
                         let observed = rendered.status_observed;
                         run.warnings.extend(rendered.warnings);
-                        match validate(rendered.response)
-                            .and_then(|response| self.ingest(&response, options, None, run))
-                        {
+                        let ingested = match validate(rendered.response) {
+                            Ok(response) => self.ingest(response, options, None, run).await,
+                            Err(e) => Err(e),
+                        };
+                        match ingested {
                             Ok(()) => {
                                 for record in &mut run.items {
-                                    record.provenance.method = "browser-dom".into();
+                                    if record.kind != "pdf_page" {
+                                        record.provenance.method = "browser-dom".into();
+                                    }
                                 }
                                 run.meta["representation"] =
                                     json!("rendered DOM; not original HTTP response bytes");
@@ -178,9 +188,9 @@ impl Fetcher {
         run.errors.push(issue);
     }
 
-    fn ingest(
+    async fn ingest(
         &self,
-        response: &Response,
+        response: Response,
         options: &Options,
         capture: Option<(&str, &str)>,
         run: &mut Run,
@@ -190,31 +200,63 @@ impl Fetcher {
             .as_ref()
             .map(|s| s.blob(&response.bytes))
             .transpose()?;
-        let mut records = if let Some((original, _)) = capture {
-            extract::extract_at(response, options, &Url::parse(original)?)?
+        let final_url = response.url.clone();
+        run.meta["http_status"] = json!(response.status.as_u16());
+        run.meta["final_url"] = json!(final_url.as_str());
+        run.meta["artifact"] = json!(artifact);
+        let mut extracted = Run::new("extract");
+        if pdf::is_pdf(&response) {
+            ensure!(
+                options.css.is_none() && matches!(options.mode, Extract::Article | Extract::Text),
+                "PDF supports --extract article or text without --css; use pdf to select physical pages"
+            );
+            let executable = self.pdf_worker.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "PDF worker is not configured; set Fetcher.pdf_worker to the ffetch executable"
+                )
+            })?;
+            let display_url = capture
+                .map(|(original, _)| Url::parse(original))
+                .transpose()?
+                .unwrap_or_else(|| final_url.clone());
+            run.meta["selected_representation"] = json!("pdf-text-layer");
+            extracted = pdf::parse_response(
+                response,
+                &display_url,
+                1,
+                pdf::DEFAULT_PAGES,
+                artifact.clone(),
+                executable,
+                self.store.as_ref(),
+            )
+            .await?;
+            run.meta["pdf"] = extracted.meta.clone();
         } else {
-            extract::extract(response, options)?
-        };
-        for record in &mut records {
+            extracted.items = if let Some((original, _)) = capture {
+                extract::extract_at(&response, options, &Url::parse(original)?)?
+            } else {
+                extract::extract(&response, options)?
+            };
+            if extract::is_html(&response) && std::str::from_utf8(&response.bytes).is_err() {
+                extracted.warnings.push("HTML is not UTF-8; text was decoded lossily. Original bytes are retained when storage is enabled".into());
+            }
+        }
+        for record in &mut extracted.items {
             record.provenance.artifact.clone_from(&artifact);
             if let Some((original, timestamp)) = capture {
                 record.source = "wayback".into();
-                record.provenance.method = "archive".into();
+                if record.kind != "pdf_page" {
+                    record.provenance.method = "archive".into();
+                }
                 record.provenance.source_url = original.into();
-                record.provenance.archive_url = Some(response.url.to_string());
+                record.provenance.archive_url = Some(final_url.to_string());
                 record.provenance.captured_at = Some(timestamp.into());
-                if record.kind != "link" {
+                if record.kind != "link" && record.kind != "pdf_page" {
                     record.url = original.into();
                 }
             }
         }
-        if extract::is_html(response) && std::str::from_utf8(&response.bytes).is_err() {
-            run.warnings.push("HTML is not UTF-8; text was decoded lossily. Original bytes are retained when storage is enabled".into());
-        }
-        run.items.extend(records);
-        run.meta["http_status"] = json!(response.status.as_u16());
-        run.meta["final_url"] = json!(response.url.as_str());
-        run.meta["artifact"] = json!(artifact);
+        run.merge(extracted);
         Ok(())
     }
 
@@ -285,7 +327,46 @@ impl Fetcher {
                     let time = chrono::NaiveDateTime::parse_from_str(&stamp, "%Y%m%d%H%M%S")?
                         .and_utc()
                         .to_rfc3339();
-                    self.ingest(&response, options, Some((url.as_str(), &time)), run)?;
+                    let mut candidate = Run::new("fetch");
+                    match self
+                        .ingest(
+                            response,
+                            options,
+                            Some((url.as_str(), &time)),
+                            &mut candidate,
+                        )
+                        .await
+                    {
+                        Ok(())
+                            if candidate.meta["selected_representation"] != "pdf-text-layer"
+                                || !candidate.items.is_empty() =>
+                        {
+                            if let Some(meta) = candidate.meta.as_object() {
+                                for (key, value) in meta {
+                                    run.meta[key.as_str()] = value.clone();
+                                }
+                            }
+                            run.merge(candidate);
+                        }
+                        result => {
+                            let reason = result.err().map(|e| e.to_string()).unwrap_or_else(|| {
+                                candidate
+                                    .errors
+                                    .iter()
+                                    .map(|e| e.message.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            });
+                            record_attempt(
+                                run,
+                                "wayback",
+                                &replay_url,
+                                &format!("unusable_capture: {reason}"),
+                                start,
+                            );
+                            continue;
+                        }
+                    }
                     record_attempt(run, "wayback", &replay_url, "ok", start);
                     run.warnings.push(format!(
                         "Historical content captured at {time}; this is not a live response"
@@ -320,7 +401,10 @@ fn validate(response: Response) -> Result<Response> {
             .unwrap_or_default()
     );
     ensure!(!response.bytes.is_empty(), "empty_response");
-    if extract::is_html(&response)
+    // A PDF MIME type can also hide an HTML challenge. Actual PDF bytes must
+    // never enter the HTML parser, regardless of the server's MIME type.
+    if !response.bytes.starts_with(b"%PDF-")
+        && extract::is_html(&response)
         && let Some(reason) = extract::invalid_content(&String::from_utf8_lossy(&response.bytes))
     {
         return Err(anyhow!(reason));

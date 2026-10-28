@@ -88,6 +88,7 @@ fn cli(args: &[&str]) -> Command {
         .env("no_proxy", "127.0.0.1,localhost");
     for key in [
         "FFETCH_ARXIV_SEARCH",
+        "FFETCH_ARXIV_PDF_BASE",
         "FFETCH_YOUTUBE_SEARCH",
         "FFETCH_YOUTUBE_WATCH",
         "FFETCH_YOUTUBE_API_BASE",
@@ -1067,6 +1068,415 @@ fn pdf_fixture(texts: &[&str], compress: bool) -> Vec<u8> {
 }
 
 #[test]
+fn fetch_reads_suffixless_pdfs_once_and_keeps_page_evidence() {
+    let bytes = pdf_fixture(&["Torque 4 N m", "Mass 200 g"], false);
+    let original = bytes.clone();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = Fixture::bytes(move |path| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        // A misleading HTML MIME type must not cause HTML challenge parsing of PDF bytes.
+        (
+            200,
+            if path == "/wrong-mime" {
+                "text/html"
+            } else {
+                "application/octet-stream"
+            },
+            bytes.clone(),
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    for (index, path) in ["download?id=42", "wrong-mime"].into_iter().enumerate() {
+        let url = server.url(path);
+        let output = cli(&["fetch", &url, "--archive", "off"])
+            .arg("--data-dir")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let run = parsed(&output);
+        assert_eq!(requests.load(Ordering::Relaxed), index + 1);
+        assert_eq!(run["meta"]["http"]["requests_started"], 1);
+        assert_eq!(run["items"].as_array().unwrap().len(), 2);
+        assert!(
+            run["items"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Torque 4 N m")
+        );
+        let page = &run["items"][1];
+        assert_eq!(page["kind"], "pdf_page");
+        assert_eq!(page["url"], format!("{url}#page=2"));
+        assert_eq!(page["provenance"]["locator"], "page:2");
+        assert_eq!(page["provenance"]["source_url"], url);
+        assert_eq!(page["provenance"]["method"], "lopdf-text-layer");
+        let meta = &run["meta"]["targets"][0];
+        assert_eq!(meta["selected_representation"], "pdf-text-layer");
+        assert_eq!(meta["pdf"]["total_pages"], 2);
+        assert_eq!(meta["artifact"], page["provenance"]["artifact"]);
+        let artifact = cli(&["artifact", meta["artifact"].as_str().unwrap()])
+            .arg("--data-dir")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(artifact.stdout, original);
+    }
+}
+
+#[test]
+fn automatic_pdf_selection_is_bounded_and_errors_remain_visible() {
+    let many = pdf_fixture(&["Evidence"; 21], false);
+    let blank = pdf_fixture(&["Usable text", ""], false);
+    let server = Fixture::bytes(move |path| {
+        (
+            200,
+            "application/pdf",
+            match path {
+                "/many" => many.clone(),
+                "/blank" => blank.clone(),
+                _ => b"%PDF-1.7\ninvalid".to_vec(),
+            },
+        )
+    });
+    let output = cli(&["fetch", &server.url("many"), "--no-store"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 20);
+    assert_eq!(
+        run["meta"]["targets"][0]["pdf"]["pages_outside_selection"],
+        1
+    );
+    assert!(run["warnings"].as_array().unwrap().iter().any(|w| {
+        w.as_str()
+            .unwrap()
+            .contains("outside the returned selection")
+    }));
+    let output = cli(&["fetch", &server.url("blank"), "--no-store"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(run["errors"][0]["code"], "pdf_page_text_unavailable");
+    assert_eq!(run["items"][1]["content"]["text_available"], false);
+    let output = cli(&["fetch", &server.url("malformed"), "--no-store"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let run = parsed(&output);
+    assert!(run["items"].as_array().unwrap().is_empty());
+    assert_eq!(run["errors"][0]["code"], "pdf_parse_failed");
+}
+
+#[test]
+fn automatic_pdf_rejects_unsupported_selectors_and_does_not_trust_url_suffixes() {
+    let pdf = pdf_fixture(&["Evidence"], false);
+    let server = Fixture::bytes(move |path| {
+        if path == "/fake.pdf" {
+            (
+                200,
+                "text/html",
+                b"<html><article>Actual HTML document</article></html>".to_vec(),
+            )
+        } else if path == "/challenge" {
+            (
+                200,
+                "application/pdf",
+                b"<html><title>captcha</title><body>Challenge</body></html>".to_vec(),
+            )
+        } else {
+            (200, "application/pdf", pdf.clone())
+        }
+    });
+    for options in [vec!["--extract", "tables"], vec!["--css", "article"]] {
+        let output = cli(&["fetch", &server.url("real"), "--no-store"])
+            .args(options)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            parsed(&output)["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("PDF supports")
+        );
+    }
+    let output = cli(&["fetch", &server.url("fake.pdf"), "--no-store"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let run = parsed(&output);
+    assert_eq!(run["items"][0]["kind"], "document");
+    assert!(
+        run["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Actual HTML document")
+    );
+    let output = cli(&[
+        "fetch",
+        &server.url("challenge"),
+        "--archive",
+        "off",
+        "--no-store",
+    ])
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let run = parsed(&output);
+    assert_eq!(run["errors"][0]["code"], "retrieval_failed");
+    assert_eq!(run["attempts"][0]["outcome"], "challenge");
+}
+
+#[test]
+fn archive_pdf_skips_bad_captures_and_preserves_original_page_urls() {
+    let pdf = pdf_fixture(&["Historical torque evidence"], false);
+    let blank = pdf_fixture(&[""], false);
+    let server = Fixture::bytes(move |path| {
+        if path.starts_with("/cdx?") {
+            (
+                200,
+                "application/json",
+                json!([
+                    ["timestamp", "original"],
+                    ["20261003000000", "https://example.org/paper"],
+                    ["20261001000000", "https://example.org/paper"]
+                ])
+                .to_string()
+                .into_bytes(),
+            )
+        } else if path.starts_with("/cdxblank?") {
+            (
+                200,
+                "application/json",
+                json!([
+                    ["timestamp", "original"],
+                    ["20261002000000", "https://example.org/paper"],
+                    ["20261001000000", "https://example.org/paper"]
+                ])
+                .to_string()
+                .into_bytes(),
+            )
+        } else {
+            (
+                200,
+                "application/pdf",
+                if path.starts_with("/web/20261003") {
+                    b"%PDF-1.7\ninvalid".to_vec()
+                } else if path.starts_with("/web/20261002") {
+                    blank.clone()
+                } else {
+                    pdf.clone()
+                },
+            )
+        }
+    });
+    let output = cli(&[
+        "fetch",
+        "https://example.org/paper",
+        "--archive",
+        "latest-valid",
+        "--no-store",
+    ])
+    .env("FFETCH_WAYBACK_CDX", server.url("cdx"))
+    .env("FFETCH_WAYBACK_REPLAY", &server.base)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    let page = &run["items"][0];
+    assert_eq!(page["url"], "https://example.org/paper#page=1");
+    assert_eq!(page["source"], "wayback");
+    assert_eq!(page["provenance"]["locator"], "page:1");
+    assert_eq!(page["provenance"]["method"], "lopdf-text-layer");
+    assert_eq!(
+        page["provenance"]["source_url"],
+        "https://example.org/paper"
+    );
+    assert_eq!(
+        page["provenance"]["captured_at"],
+        "2026-10-01T00:00:00+00:00"
+    );
+    assert!(
+        page["provenance"]["archive_url"]
+            .as_str()
+            .unwrap()
+            .contains("20261001000000id_")
+    );
+    assert_eq!(
+        run["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["outcome"]
+                .as_str()
+                .unwrap()
+                .starts_with("unusable_capture:"))
+            .count(),
+        1
+    );
+    assert!(run["errors"].as_array().unwrap().is_empty());
+    // A structurally valid PDF without a text layer still exists. Keep this
+    // capture with partial status rather than silently substituting older text.
+    let output = cli(&[
+        "fetch",
+        "https://example.org/paper",
+        "--archive",
+        "latest-valid",
+        "--no-store",
+    ])
+    .env("FFETCH_WAYBACK_CDX", server.url("cdxblank"))
+    .env("FFETCH_WAYBACK_REPLAY", &server.base)
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(
+        run["items"][0]["provenance"]["captured_at"],
+        "2026-10-02T00:00:00+00:00"
+    );
+    assert_eq!(run["items"][0]["content"]["text_available"], false);
+    assert_eq!(run["errors"][0]["code"], "pdf_page_text_unavailable");
+}
+
+#[test]
+fn search_read_extracts_discovered_pdf_once_across_query_variants() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = reads.clone();
+    let pdf = pdf_fixture(&["Gripper CAD measurements", "Tendon force 4 N"], false);
+    let document = Fixture::bytes(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        (200, "application/octet-stream", pdf.clone())
+    });
+    let link = document
+        .url("download?id=42")
+        .replace("127.0.0.1", "localhost");
+    let server = Fixture::new(move |_| {
+        (
+            200,
+            "text/html",
+            format!(
+                "<li class='b_algo'><h2><a href='{link}'>Gripper paper</a></h2><div class='b_caption'><p>Research</p></div></li>"
+            ),
+        )
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "tendon",
+        "--sources",
+        "web",
+        "--engines",
+        "bing",
+        "--search-mode",
+        "balanced",
+        "--read",
+        "--no-store",
+    ])
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    let items = run["items"].as_array().unwrap();
+    let discovery = items.iter().find(|r| r["kind"] != "pdf_page").unwrap();
+    let pages = items
+        .iter()
+        .filter(|r| r["kind"] == "pdf_page")
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2);
+    for page in pages {
+        assert_eq!(page["native"]["discovered_from"], discovery["id"]);
+    }
+    assert_eq!(run["meta"]["read_coverage"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        run["meta"]["read_coverage"][0]["meta"]["selected_representation"],
+        "pdf-text-layer"
+    );
+    assert_eq!(run["meta"]["http"]["requests_started"], 3);
+}
+
+#[test]
+fn arxiv_search_read_follows_versioned_pdf_without_repeating_metadata_lookup() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let pdf = pdf_fixture(&["Version two research body"], false);
+    let server = Fixture::bytes(move |path| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        if path.starts_with("/query?") {
+            assert!(!path.contains("id_list"), "unnecessary metadata lookup");
+            (
+                200,
+                "application/atom+xml",
+                arxiv_feed(&arxiv_entry("2501.12345v2"), 1).into_bytes(),
+            )
+        } else {
+            assert_eq!(path, "/pdf/2501.12345v2");
+            (200, "application/pdf", pdf.clone())
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "arxiv",
+        "--read",
+        "--no-store",
+    ])
+    .env("FFETCH_ARXIV_SEARCH", server.url("query"))
+    .env("FFETCH_ARXIV_PDF_BASE", server.url("pdf/"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    let metadata = run["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "paper")
+        .unwrap();
+    let body = run["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "pdf_page")
+        .unwrap();
+    assert!(
+        body["text"]
+            .as_str()
+            .unwrap()
+            .contains("Version two research body")
+    );
+    assert_eq!(body["native"]["discovered_from"], metadata["id"]);
+    assert_eq!(
+        run["meta"]["read_coverage"][0]["meta"]["arxiv_id"],
+        "2501.12345v2"
+    );
+}
+
+#[test]
 fn pdf_decompressed_page_limit_rejects_small_compressed_bombs() {
     let large = "A".repeat(17 * 1024 * 1024);
     let bytes = pdf_fixture(&[&large], true);
@@ -1164,7 +1574,7 @@ fn pdf_rejects_html_and_malformed_documents_without_false_success() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pdf_deadline_terminates_its_worker_process() {
+async fn pdf_deadline_terminates_workers_for_explicit_and_automatic_reads() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("worker");
@@ -1189,11 +1599,59 @@ async fn pdf_deadline_terminates_its_worker_process() {
     )
     .await;
     assert_eq!(run.errors[0].code, "deadline_exceeded");
-    let pid: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().parse().unwrap();
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
+    );
+    let store = ffetch::store::Store::new(dir.path().join("evidence"));
+    let mut fetcher = ffetch::fetch::Fetcher {
+        http,
+        browser: None,
+        browser_mode: ffetch::browser::Mode::Off,
+        store: Some(store.clone()),
+        budget: Duration::from_millis(200),
+        cdx: url::Url::parse(&server.url("cdx")).unwrap(),
+        replay: url::Url::parse(&server.base).unwrap(),
+        archive_limit: 1,
+        pdf_worker: Some(script),
+    };
+    let run = fetcher
+        .fetch(
+            &server.url("pdf"),
+            &ffetch::extract::Options::default(),
+            ffetch::fetch::Archive::Off,
+        )
+        .await;
+    assert_eq!(run.errors[0].code, "deadline_exceeded");
+    assert_eq!(run.meta["selected_representation"], "pdf-text-layer");
+    assert_eq!(
+        store
+            .read_blob(run.meta["artifact"].as_str().unwrap())
+            .unwrap(),
+        b"%PDF-1.7\n"
+    );
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().parse().unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    // A library consumer must explicitly configure ffetch, never spawn its own host.
+    fetcher.pdf_worker = None;
+    let run = fetcher
+        .fetch(
+            &server.url("pdf"),
+            &ffetch::extract::Options::default(),
+            ffetch::fetch::Archive::Off,
+        )
+        .await;
+    assert_eq!(run.errors[0].code, "extraction_error");
+    assert!(
+        run.errors[0]
+            .message
+            .contains("PDF worker is not configured")
     );
 }
 

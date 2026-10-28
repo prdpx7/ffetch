@@ -44,11 +44,14 @@ impl Store {
         Ok(serde_json::from_slice(&data)?)
     }
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.blob_path(hash)?)?)
+    }
+    pub(crate) fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         ensure!(
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "artifact must be a SHA-256 hash"
         );
-        Ok(std::fs::read(self.root.join("blobs").join(hash))?)
+        Ok(self.root.join("blobs").join(hash))
     }
 }
 

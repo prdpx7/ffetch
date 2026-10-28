@@ -13,6 +13,7 @@ use std::{
 };
 const STREAM_LIMIT: usize = 16 * 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 32 * 1024 * 1024;
+pub const DEFAULT_PAGES: u32 = 20;
 
 struct Worker(Child);
 impl Drop for Worker {
@@ -175,49 +176,17 @@ pub async fn fetch(
         let artifact = store.map(|s| s.blob(&response.bytes)).transpose()?;
         run.meta["artifact"] = json!(artifact);
         run.meta["final_url"] = json!(response.url.as_str());
-        ensure!(
-            response.bytes.starts_with(b"%PDF-"),
-            "response does not begin with a PDF signature"
-        );
-        let directory = tempfile::Builder::new().prefix("ffetch-pdf-").tempdir()?;
-        let input_file = directory.path().join("source.pdf");
-        let output_file = directory.path().join("result.json");
-        std::fs::write(&input_file, &response.bytes)?;
-        let final_url = response.url.to_string();
-        drop(response);
-        let mut child = Worker(
-            Command::new(executable)
-                .arg("__pdf-worker")
-                .arg(&input_file)
-                .arg(&output_file)
-                .arg(final_url)
-                .arg(start.to_string())
-                .arg(count.to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("could not start PDF worker")?,
-        );
-        loop {
-            if let Some(status) = child.0.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "PDF worker failed or exceeded resource limits ({status}); original artifact retained when storage is enabled"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let size = std::fs::metadata(&output_file)?.len();
-        ensure!(
-            size <= OUTPUT_LIMIT,
-            "PDF worker result exceeds byte budget"
-        );
-        let mut parsed: Run = serde_json::from_reader(std::fs::File::open(output_file)?)?;
-        for record in &mut parsed.items {
-            record.provenance.artifact = artifact.clone();
-        }
+        let final_url = response.url.clone();
+        let parsed = parse_response(
+            response,
+            &final_url,
+            start,
+            count,
+            artifact.clone(),
+            executable,
+            store,
+        )
+        .await?;
         if let Some(metadata) = parsed.meta.as_object() {
             for (key, value) in metadata {
                 run.meta[key.as_str()] = value.clone();
@@ -240,4 +209,83 @@ pub async fn fetch(
     }
     run.finish(began.elapsed().as_millis() as u64);
     run
+}
+
+pub(crate) fn is_pdf(response: &crate::net::Response) -> bool {
+    response.bytes.starts_with(b"%PDF-")
+        || response
+            .content_type
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/pdf"))
+}
+
+/// Consume bytes already retrieved and saved by the caller. The caller also
+/// supplies the shared deadline and the same-binary worker executable.
+pub(crate) async fn parse_response(
+    response: crate::net::Response,
+    display_url: &url::Url,
+    start: u32,
+    count: u32,
+    artifact: Option<String>,
+    executable: &Path,
+    store: Option<&Store>,
+) -> Result<Run> {
+    ensure!(
+        response.bytes.starts_with(b"%PDF-"),
+        "response does not begin with a PDF signature"
+    );
+    let directory = tempfile::Builder::new().prefix("ffetch-pdf-").tempdir()?;
+    let input_file = if let Some((store, hash)) = store.zip(artifact.as_deref()) {
+        // The artifact is already durable; let the worker open it directly.
+        store.blob_path(hash)?
+    } else {
+        let file = directory.path().join("source.pdf");
+        std::fs::write(&file, &response.bytes)?;
+        file
+    };
+    let output_file = directory.path().join("result.json");
+    let final_url = display_url.to_string();
+    drop(response);
+    let mut child = Worker(
+        Command::new(executable)
+            .arg("__pdf-worker")
+            .arg(&input_file)
+            .arg(&output_file)
+            .arg(final_url)
+            .arg(start.to_string())
+            .arg(count.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("could not start PDF worker")?,
+    );
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            ensure!(
+                status.success(),
+                "PDF worker failed or exceeded resource limits ({status}); original artifact retained when storage is enabled"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let size = std::fs::metadata(&output_file)?.len();
+    ensure!(
+        size <= OUTPUT_LIMIT,
+        "PDF worker result exceeds byte budget"
+    );
+    let mut parsed: Run = serde_json::from_reader(std::fs::File::open(output_file)?)?;
+    for record in &mut parsed.items {
+        record.provenance.artifact = artifact.clone();
+    }
+    if parsed.meta["pages_outside_selection"]
+        .as_u64()
+        .is_some_and(|pages| pages > 0)
+    {
+        parsed.warnings.push("PDF has pages outside the returned selection; use pdf --page N --limit N to read another range".into());
+    }
+
+    Ok(parsed)
 }
