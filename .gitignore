@@ -1,24 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-wheels/
+# Rust build output
+/target/
 
-# Virtual environments
-.venv/
+# Local environment and cache
 .env
+.venv/
+.cache/
 
-# IDE
+# Editors
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# OS
+# Operating systems
 .DS_Store
 Thumbs.db
-
-# ffetch cache
-.cache/
