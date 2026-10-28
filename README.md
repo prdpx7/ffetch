@@ -116,6 +116,22 @@ other CLI processes use separate state.
 
 ## Research sources
 
+```sh
+ffetch references '10.1038/nphys1170' --depth 2 --limit 20
+```
+
+`references` follows explicit DOI references reported by Crossref. Depth is 1-3,
+with 1 by default. The limit bounds reference entries inspected across the graph,
+including duplicates and entries without a usable DOI. At most one seed plus
+that many unique referenced works can be looked up. Breadth first waves resolve
+works concurrently within each wave and avoid repeated lookups and cycles.
+
+Work metadata is returned as records. `meta.edges` retains reference entries,
+provenance, and fetched/failed/pending/unresolved status. Missing lists and DOIs
+remain explicit. These are provider-reported references, not independently
+verified citations or parsed full text. Other DOI agencies and non-DOI references
+may remain unresolved. Output is collected until traversal completes.
+
 | Source | Operations |
 | --- | --- |
 | `hn` | Search, feeds, stories, bounded comment trees |

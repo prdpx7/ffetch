@@ -13,6 +13,11 @@ pub fn identity(record: &Record) -> Option<String> {
             .map(|id| format!("arxiv:{id}"));
     }
     let raw = record.content["doi"].as_str()?;
+    doi_identity(raw)
+}
+
+/// Canonical DOI key, without title matching or registry-validity assumptions.
+pub fn doi_identity(raw: &str) -> Option<String> {
     if raw != raw.trim() {
         return None;
     }

@@ -107,6 +107,15 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Follow DOI references through bounded Crossref metadata lookups.
+    References {
+        doi: String,
+        /// Maximum reference entries inspected across the traversal.
+        #[arg(long, default_value="20", value_parser=parse_positive)]
+        limit: usize,
+        #[arg(long, default_value="1", value_parser=clap::value_parser!(u32).range(1..=3))]
+        depth: u32,
+    },
     /// Fetch URLs; '-' reads one URL per line from stdin.
     Fetch(FetchArgs),
     /// Search multiple sources concurrently; returns evidence and provider failures.
@@ -262,6 +271,12 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse_from(args);
     let result = (|| {
+        if let Command::References { doi, .. } = &cli.command {
+            ensure!(
+                ffetch::citations::doi(doi).is_some(),
+                "references requires a DOI or DOI resolver URL"
+            );
+        }
         if let Command::Search {
             query,
             queries,
@@ -300,8 +315,9 @@ fn main() -> ExitCode {
                         | Command::Trends { .. }
                         | Command::Thread { .. }
                         | Command::Transcript { .. }
+                        | Command::References { .. }
                 ),
-            "--sample applies to fetch, search, trends, thread, or transcript output"
+            "--sample applies to fetch, search, trends, thread, transcript, or references output"
         );
         let query = query::Query::compile(cli.jq.as_deref(), cli.jmespath.as_deref())?;
         if let Some(code) = execute_local(&cli, &query)? {
@@ -459,6 +475,17 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
     let start = Instant::now();
     let mut live = LiveOutput::new(cli);
     let mut run = match &cli.command {
+        Command::References { doi, limit, depth } => {
+            ffetch::citations::references(
+                &providers.http,
+                doi,
+                *depth,
+                *limit,
+                cli.concurrency,
+                timeout,
+            )
+            .await
+        }
         Command::Browser { action } => {
             browser_config
                 .execute(
@@ -1063,6 +1090,9 @@ fn output(cli: &Cli, query: &query::Query, mut value: Value) -> Result<()> {
                         if let Some(url) = item["url"].as_str() {
                             writeln!(out, "{url}")?;
                         }
+                        if let Some(depth) = item["native"]["citation_depth"].as_u64() {
+                            writeln!(out, "Citation depth: {depth}")?;
+                        }
                         if let Some(origins) = item["native"]["origins"].as_array() {
                             let engines = origins
                                 .iter()
@@ -1186,6 +1216,7 @@ fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
         "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},
         "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
         "http":{"global_concurrency_default":8,"origin_concurrency_default":4,"origin_flag":"--origin-concurrency","attempt_timeout_seconds":15,"redirect_limit":10,"redirect_origin_limits":true,"retry_after":{"statuses":[429,503],"max_retries_per_get":1,"valid_header_required":true,"remaining_budget":true,"redirect_delays":true,"cross_process_coordination":false},"telemetry":"meta.http","browser_network_scheduled":false},
         "browser":{"backend":"chromium-cdp","optional_runtime":true,"sessions":true,"navigation":true,"inspection_refs":true,"click_fill_press":true,"screenshots":true,"document_fallback":true,"search_engine_fallback":true},

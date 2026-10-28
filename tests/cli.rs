@@ -88,6 +88,7 @@ fn cli(args: &[&str]) -> Command {
         "FFETCH_REDDIT_BASE",
         "FFETCH_REDDIT_TOKEN",
         "FFETCH_CROSSREF_SEARCH",
+        "FFETCH_CROSSREF_WORKS",
         "FFETCH_EUROPEPMC_SEARCH",
         "FFETCH_CONTACT_EMAIL",
         "FFETCH_SEARXNG_URL",
@@ -1018,6 +1019,160 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
     assert_eq!(data["items"][0]["metrics"]["engine_count"], 1);
     assert_eq!(data["errors"][0]["source"], "engine:google");
     assert_eq!(data["meta"]["coverage"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn references_traverse_reported_dois_without_repeating_cycles_or_inventing_links() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let server = Fixture::new(move |path| {
+        observed.lock().unwrap().push(path.to_owned());
+        let decoded = path.replace("%2F", "/").replace("%2f", "/");
+        let id = decoded.strip_prefix("/works/").unwrap();
+        let refs = match id {
+            "10.1000/root" => {
+                json!([{"DOI":"10.1000/a"},{"DOI":"10.1000/a"},{"unstructured":"Unresolved historical source"},{"DOI":"not a doi"},{"DOI":"10.1000/b"}])
+            }
+            "10.1000/a" => json!([{"DOI":"10.1000/root"},{"DOI":"10.1000/leaf"}]),
+            "10.1000/b" => json!([{"DOI":"10.1000/leaf"}]),
+            "10.1000/leaf" => json!([]),
+            _ => panic!("unexpected lookup {id}"),
+        };
+        (200,"application/json",json!({"status":"ok","message-type":"work","message":{"DOI":id,"title":[id],"type":"journal-article","reference":refs,"reference-count":refs.as_array().unwrap().len()}}).to_string())
+    });
+    let output = cli(&[
+        "references",
+        "https://doi.org/10.1000/ROOT",
+        "--depth",
+        "3",
+        "--limit",
+        "20",
+        "--no-store",
+    ])
+    .env("FFETCH_CROSSREF_WORKS", server.url("works"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 4);
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    assert_eq!(run["meta"]["edges"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        run["meta"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["lookup_status"] == "unresolved_doi")
+            .count(),
+        2
+    );
+    assert_eq!(
+        run["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["content"]["doi"] == "10.1000/leaf")
+            .unwrap()["native"]["citation_depth"],
+        2
+    );
+    let output = cli(&[
+        "references",
+        "10.1000/root",
+        "--depth",
+        "1",
+        "--limit",
+        "1",
+        "--no-store",
+    ])
+    .env("FFETCH_CROSSREF_WORKS", server.url("works"))
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    assert_eq!(run["meta"]["references_inspected"], 1);
+    assert_eq!(run["meta"]["reference_budget_exhausted"], true);
+    assert_eq!(
+        run["items"][0]["content"]["references"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(requests.lock().unwrap().len(), 6);
+}
+
+#[test]
+fn references_retain_completed_work_and_distinguish_failed_pending_and_unknown_coverage() {
+    let server = Fixture::new(|path| {
+        let decoded = path.replace("%2F", "/").replace("%2f", "/");
+        let id = decoded.strip_prefix("/works/").unwrap();
+        if id == "10.1000/missing" {
+            return (404, "text/plain", "missing".into());
+        }
+        if id == "10.1000/slow" {
+            thread::sleep(Duration::from_millis(1500));
+        }
+        let actual = if id == "10.1000/mismatch" {
+            "10.1000/unrelated"
+        } else {
+            id
+        };
+        let mut data = json!({"DOI":actual,"type":"journal-article","title":[actual]});
+        if id == "10.1000/root" {
+            data["reference"] = json!([{"DOI":"10.1000/good"},{"DOI":"10.1000/missing"},{"DOI":"10.1000/mismatch"},{"DOI":"10.1000/slow"}]);
+        }
+        (
+            200,
+            "application/json",
+            json!({"status":"ok","message-type":"work","message":data}).to_string(),
+        )
+    });
+    let output = cli(&[
+        "references",
+        "10.1000/root",
+        "--depth",
+        "2",
+        "--timeout",
+        "1",
+        "--no-store",
+    ])
+    .env("FFETCH_CROSSREF_WORKS", server.url("works"))
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(run["meta"]["fetched_works"], 2);
+    assert_eq!(run["meta"]["failed_works"], 2);
+    assert_eq!(run["meta"]["pending_works"], 1);
+    assert_eq!(run["meta"]["unavailable_reference_lists"], 1);
+    assert!(
+        run["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"].as_str().unwrap().contains("does not match"))
+    );
+    assert!(
+        run["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "deadline_exceeded")
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("absent");
+    let output = cli(&["references", "not-a-doi"])
+        .arg("--data-dir")
+        .arg(&absent)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!absent.exists());
 }
 
 #[test]

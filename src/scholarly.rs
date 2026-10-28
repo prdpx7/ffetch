@@ -162,7 +162,7 @@ fn doi_url(doi: &str) -> Result<String> {
 fn plain(value: Option<&str>) -> Option<String> {
     value.map(extract::text).filter(|s| !s.is_empty())
 }
-fn crossref_record(item: &Value) -> Result<Record> {
+pub(crate) fn crossref_record(item: &Value) -> Result<Record> {
     let doi = item["DOI"]
         .as_str()
         .filter(|s| !s.is_empty())
