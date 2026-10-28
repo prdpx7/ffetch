@@ -90,6 +90,7 @@ fn cli(args: &[&str]) -> Command {
         "FFETCH_CROSSREF_SEARCH",
         "FFETCH_CROSSREF_WORKS",
         "FFETCH_EUROPEPMC_SEARCH",
+        "FFETCH_EUROPEPMC_FULLTEXT",
         "FFETCH_CONTACT_EMAIL",
         "FFETCH_SEARXNG_URL",
         "FFETCH_HN_BASE",
@@ -1019,6 +1020,86 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
     assert_eq!(data["items"][0]["metrics"]["engine_count"], 1);
     assert_eq!(data["errors"][0]["source"], "engine:google");
     assert_eq!(data["meta"]["coverage"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn fulltext_preserves_jats_body_tables_math_and_original_xml() {
+    let xml = "<?xml version='1.0' encoding='UTF-8'?><!DOCTYPE article SYSTEM 'https://invalid.example/article.dtd'><article xmlns:m='http://www.w3.org/1998/Math/MathML' article-type='research-article'><front><article-meta><article-id pub-id-type='pmcid'>PMC123</article-id><article-id pub-id-type='doi'>10.1000/grip</article-id><title-group><article-title>Robot <italic>gripper</italic></article-title></title-group><abstract><p>Abstract only</p></abstract></article-meta></front><body><sec id='s1'><title>Methods</title><p id='p1'>Soft <bold>gripper</bold> &amp; control.</p><table-wrap id='t1'><table><tr><th>Torque</th></tr><tr><td colspan='2'>4 N m</td></tr></table></table-wrap><disp-formula><m:math><m:mi>x</m:mi></m:math></disp-formula></sec></body><back><ref-list><ref id='r1'><mixed-citation>Source reference</mixed-citation></ref></ref-list></back></article>";
+    let server = Fixture::new(move |_| (200, "application/xml", xml.into()));
+    let dir = tempfile::tempdir().unwrap();
+    let output = cli(&["fulltext", "https://pmc.ncbi.nlm.nih.gov/articles/PMC123/"])
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env("FFETCH_EUROPEPMC_FULLTEXT", server.url("rest"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    let record = &run["items"][0];
+    assert_eq!(record["title"], "Robot gripper");
+    assert!(
+        record["text"]
+            .as_str()
+            .unwrap()
+            .contains("Soft gripper & control.")
+    );
+    assert!(!record["text"].as_str().unwrap().contains("Abstract only"));
+    assert_eq!(
+        record["content"]["tables"][0]["rows"][1][0]["text"],
+        "4 N m"
+    );
+    assert_eq!(record["content"]["tables"][0]["rows"][1][0]["colspan"], "2");
+    assert_eq!(record["content"]["references"][0]["id"], "r1");
+    assert_eq!(record["content"]["math_present"], true);
+    assert_eq!(record["content"]["external_entities_resolved"], false);
+    assert!(!run["warnings"].as_array().unwrap().is_empty());
+    let saved = cli(&[
+        "artifact",
+        record["provenance"]["artifact"].as_str().unwrap(),
+    ])
+    .arg("--data-dir")
+    .arg(dir.path())
+    .output()
+    .unwrap();
+    assert_eq!(saved.stdout, xml.as_bytes());
+}
+
+#[test]
+fn fulltext_rejects_mismatched_identity_dtd_entities_and_non_article_responses() {
+    let server = Fixture::new(|path| {
+        let xml = if path.contains("PMC124/") {
+            "<article><front><article-meta><article-id pub-id-type='pmc'>123</article-id></article-meta></front><body><p>Wrong paper</p></body></article>"
+        } else if path.contains("PMC125/") {
+            "<!DOCTYPE article [<!ENTITY steal SYSTEM 'file:///etc/passwd'>]><article>&steal;</article>"
+        } else if path.contains("PMC126/") {
+            "<article><front>"
+        } else {
+            "<html><body>Access denied</body></html>"
+        };
+        (200, "application/xml", xml.into())
+    });
+    for id in ["PMC124", "PMC125", "PMC126", "PMC127"] {
+        let output = cli(&["fulltext", id, "--no-store"])
+            .env("FFETCH_EUROPEPMC_FULLTEXT", server.url("rest"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let run = parsed(&output);
+        assert!(run["items"].as_array().unwrap().is_empty());
+        assert_eq!(run["errors"][0]["code"], "fulltext_unavailable");
+    }
+    for input in [
+        "123",
+        "https://evil.example/articles/PMC123/",
+        "https://user:secret@europepmc.org/articles/PMC123/",
+    ] {
+        let output = cli(&["fulltext", input, "--no-store"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
 }
 
 #[test]

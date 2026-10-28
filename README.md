@@ -117,6 +117,19 @@ other CLI processes use separate state.
 ## Research sources
 
 ```sh
+ffetch fulltext PMC11762333
+```
+
+`fulltext` retrieves available open-access JATS XML from Europe PMC by PMCID or
+a supported PMC article URL. It checks article identity and returns body text,
+blocks with source locators, table cells, references, authors, and publication
+date parts. The original XML is saved as an artifact unless `--no-store` is used.
+DTD files are never loaded, and internal entity declarations are rejected.
+MathML layout and images are not fully represented in the text output. This
+command does not parse PDFs; unavailable or restricted XML returns a structured
+failure. Search `--read` does not yet select this representation automatically.
+
+```sh
 ffetch references '10.1038/nphys1170' --depth 2 --limit 20
 ```
 

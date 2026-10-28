@@ -107,6 +107,8 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Retrieve open-access JATS article text by PMCID.
+    Fulltext { input: String },
     /// Follow DOI references through bounded Crossref metadata lookups.
     References {
         doi: String,
@@ -271,6 +273,12 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse_from(args);
     let result = (|| {
+        if let Command::Fulltext { input } = &cli.command {
+            ensure!(
+                ffetch::fulltext::pmcid(input).is_some(),
+                "fulltext requires a PMCID or supported PMC article URL"
+            );
+        }
         if let Command::References { doi, .. } = &cli.command {
             ensure!(
                 ffetch::citations::doi(doi).is_some(),
@@ -316,6 +324,7 @@ fn main() -> ExitCode {
                         | Command::Thread { .. }
                         | Command::Transcript { .. }
                         | Command::References { .. }
+                        | Command::Fulltext { .. }
                 ),
             "--sample applies to fetch, search, trends, thread, transcript, or references output"
         );
@@ -475,6 +484,15 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
     let start = Instant::now();
     let mut live = LiveOutput::new(cli);
     let mut run = match &cli.command {
+        Command::Fulltext { input } => {
+            ffetch::fulltext::fetch(
+                &providers.http,
+                input,
+                (!cli.no_store).then_some(&store),
+                timeout,
+            )
+            .await
+        }
         Command::References { doi, limit, depth } => {
             ffetch::citations::references(
                 &providers.http,
@@ -1216,6 +1234,7 @@ fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
         "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":false},
         "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},
         "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
         "http":{"global_concurrency_default":8,"origin_concurrency_default":4,"origin_flag":"--origin-concurrency","attempt_timeout_seconds":15,"redirect_limit":10,"redirect_origin_limits":true,"retry_after":{"statuses":[429,503],"max_retries_per_get":1,"valid_header_required":true,"remaining_budget":true,"redirect_delays":true,"cross_process_coordination":false},"telemetry":"meta.http","browser_network_scheduled":false},
