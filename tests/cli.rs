@@ -19,6 +19,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(route: impl Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static) -> Self {
+        Self::bytes(move |path| {
+            let (status, mime, body) = route(path);
+            (status, mime, body.into_bytes())
+        })
+    }
+    fn bytes(route: impl Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -41,8 +47,9 @@ impl Fixture {
                             let request = String::from_utf8_lossy(&request);
                             let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
                             let (status,mime,body) = route(path);
-                            let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                            let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
                             let _ = socket.write_all(response.as_bytes());
+                            let _ = socket.write_all(&body);
                         }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1020,6 +1027,174 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
     assert_eq!(data["items"][0]["metrics"]["engine_count"], 1);
     assert_eq!(data["errors"][0]["source"], "engine:google");
     assert_eq!(data["meta"]["coverage"].as_array().unwrap().len(), 2);
+}
+
+fn pdf_fixture(texts: &[&str], compress: bool) -> Vec<u8> {
+    use lopdf::{
+        Document, Object, Stream,
+        content::{Content, Operation},
+        dictionary,
+    };
+    let mut doc = Document::with_version("1.5");
+    let pages = doc.new_object_id();
+    let font =
+        doc.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let resources = doc.add_object(dictionary! {"Font"=>dictionary!{"F1"=>font}});
+    let mut kids = Vec::new();
+    for &text in texts {
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![10.into(), 30.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let stream = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page = doc.add_object(dictionary! {"Type"=>"Page","Parent"=>pages,"Contents"=>stream});
+        kids.push(page.into());
+    }
+    doc.objects.insert(pages,dictionary!{"Type"=>"Pages","Kids"=>kids,"Count"=>texts.len() as i64,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),200.into(),200.into()]}.into());
+    let catalog = doc.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages});
+    doc.trailer.set("Root", catalog);
+    if compress {
+        doc.compress();
+    }
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn pdf_decompressed_page_limit_rejects_small_compressed_bombs() {
+    let large = "A".repeat(17 * 1024 * 1024);
+    let bytes = pdf_fixture(&[&large], true);
+    assert!(bytes.len() < 100_000);
+    let server = Fixture::bytes(move |_| (200, "application/pdf", bytes.clone()));
+    let output = cli(&["pdf", &server.url("bomb"), "--no-store"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(run["errors"][0]["code"], "pdf_page_text_unavailable");
+    assert_eq!(run["items"][0]["content"]["text_available"], false);
+}
+
+#[test]
+fn pdf_selected_pages_keep_text_locators_and_original_artifacts() {
+    let bytes = pdf_fixture(&["Torque 4 N m", "Mass 200 g", ""], false);
+    let expected = bytes.clone();
+    let server = Fixture::bytes(move |_| (200, "application/pdf", bytes.clone()));
+    let dir = tempfile::tempdir().unwrap();
+    let output = cli(&["pdf", &server.url("paper"), "--limit", "2"])
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    assert!(
+        run["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Torque 4 N m")
+    );
+    assert!(
+        run["items"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Mass 200 g")
+    );
+    assert_eq!(run["items"][1]["provenance"]["locator"], "page:2");
+    assert_eq!(run["meta"]["pages_outside_selection"], 1);
+    let original = cli(&["artifact", run["meta"]["artifact"].as_str().unwrap()])
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(original.stdout, expected);
+    let output = cli(&[
+        "pdf",
+        &server.url("paper"),
+        "--page",
+        "3",
+        "--limit",
+        "1",
+        "--no-store",
+    ])
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(run["items"][0]["content"]["text_available"], false);
+    assert_eq!(run["errors"][0]["code"], "pdf_page_text_unavailable");
+    let output = cli(&["pdf", &server.url("paper"), "--page", "4", "--no-store"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn pdf_rejects_html_and_malformed_documents_without_false_success() {
+    let server = Fixture::new(|path| {
+        (
+            200,
+            "application/pdf",
+            if path == "/html" {
+                "<html>Access denied</html>".into()
+            } else {
+                "%PDF-1.7\ninvalid".into()
+            },
+        )
+    });
+    for path in ["html", "bad"] {
+        let output = cli(&["pdf", &server.url(path), "--no-store"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(parsed(&output)["items"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pdf_deadline_terminates_its_worker_process() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("worker");
+    let pidfile = dir.path().join("pid");
+    let quoted = format!("'{}'", pidfile.to_string_lossy().replace('\'', "'\\''"));
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf '%s' \"$$\" > {quoted}\nwhile :; do :; done\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = Fixture::new(|_| (200, "application/pdf", "%PDF-1.7\n".into()));
+    let http = ffetch::net::Http::new(Duration::from_secs(2), 4096, 1).unwrap();
+    let run = ffetch::pdf::fetch(
+        &http,
+        &server.url("pdf"),
+        1,
+        1,
+        None,
+        Duration::from_millis(200),
+        &script,
+    )
+    .await;
+    assert_eq!(run.errors[0].code, "deadline_exceeded");
+    let pid: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]

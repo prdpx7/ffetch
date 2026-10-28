@@ -117,6 +117,22 @@ other CLI processes use separate state.
 ## Research sources
 
 ```sh
+ffetch pdf 'https://example.org/paper.pdf' --page 1 --limit 20
+```
+
+`pdf` extracts text-layer content by physical page number. The page limit is
+1-500, with 20 by default. Records include page locators and the original PDF
+artifact. Pages outside the selection and pages without usable text are reported.
+This does not perform OCR or reconstruct columns, table cells, images, or formulas.
+
+Extraction uses an embedded Rust parser in a child process of the same binary.
+The retrieval/extraction deadline cancels that process. Unix workers have a
+512 MiB address-space limit; streams and output also have byte limits. The
+Windows memory limit is not implemented. Password-protected PDFs are unsupported.
+No separate PDF tool is required. `fetch` and `search --read` do not yet choose
+this PDF extractor automatically.
+
+```sh
 ffetch fulltext PMC11762333
 ```
 

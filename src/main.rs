@@ -107,6 +107,22 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Extract text-layer content from selected PDF pages.
+    Pdf {
+        url: String,
+        #[arg(long,default_value="1",value_parser=clap::value_parser!(u32).range(1..))]
+        page: u32,
+        #[arg(long,default_value="20",value_parser=clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
+    },
+    #[command(name = "__pdf-worker", hide = true)]
+    PdfWorker {
+        input: PathBuf,
+        output: PathBuf,
+        url: String,
+        page: u32,
+        limit: u32,
+    },
     /// Retrieve open-access JATS article text by PMCID.
     Fulltext { input: String },
     /// Follow DOI references through bounded Crossref metadata lookups.
@@ -325,8 +341,9 @@ fn main() -> ExitCode {
                         | Command::Transcript { .. }
                         | Command::References { .. }
                         | Command::Fulltext { .. }
+                        | Command::Pdf { .. }
                 ),
-            "--sample applies to fetch, search, trends, thread, transcript, or references output"
+            "--sample applies to fetch, search, trends, thread, transcript, references, or PDF output"
         );
         let query = query::Query::compile(cli.jq.as_deref(), cli.jmespath.as_deref())?;
         if let Some(code) = execute_local(&cli, &query)? {
@@ -353,6 +370,17 @@ fn main() -> ExitCode {
 }
 
 fn execute_local(cli: &Cli, query: &query::Query) -> Result<Option<u8>> {
+    if let Command::PdfWorker {
+        input,
+        output,
+        url,
+        page,
+        limit,
+    } = &cli.command
+    {
+        ffetch::pdf::worker(input, output, url, *page, *limit)?;
+        return Ok(Some(0));
+    }
     if matches!(cli.command, Command::Capabilities) {
         output(cli, query, capabilities())?;
         return Ok(Some(0));
@@ -484,6 +512,18 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
     let start = Instant::now();
     let mut live = LiveOutput::new(cli);
     let mut run = match &cli.command {
+        Command::Pdf { url, page, limit } => {
+            ffetch::pdf::fetch(
+                &providers.http,
+                url,
+                *page,
+                *limit,
+                (!cli.no_store).then_some(&store),
+                timeout,
+                &std::env::current_exe()?,
+            )
+            .await
+        }
         Command::Fulltext { input } => {
             ffetch::fulltext::fetch(
                 &providers.http,
@@ -1234,6 +1274,7 @@ fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
         "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "pdf":{"command":"pdf","parser":"lopdf 0.46","external_runtime":false,"isolated_worker":true,"unix_address_space_limit_bytes":536870912,"default_pages":20,"maximum_pages":500,"ocr":false,"layout_verified":false,"automatic_fetch":false},
         "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":true,"trigger":"PMCID metadata or supported PMC URL","doi_assertion_check":true},
         "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},
         "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
