@@ -21,6 +21,18 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
+pub(crate) fn startup_issue(source: &str, message: &str) -> Option<Issue> {
+    if !message.contains("browser exited during startup")
+        && !message.contains("browser unavailable for this run")
+        && !message.contains("could not launch browser executable")
+    {
+        return None;
+    }
+    let mut issue = Issue::new(source, "browser_unavailable", message);
+    issue.next_action = Some("Check Chromium installation and sandbox support, select another executable with --browser-path, or use --browser off to keep HTTP retrieval available".into());
+    Some(issue)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, ValueEnum)]
 pub enum Mode {
     #[default]
@@ -104,8 +116,12 @@ impl Config {
         {
             Ok(Ok(())) => (),
             Ok(Err(e)) => {
-                let mut issue = Issue::new("browser", "browser_operation_failed", format!("{e:#}"));
-                issue.next_action=Some("Inspect the session status; refresh element references with browser inspect after navigation or DOM changes".into());
+                let message = format!("{e:#}");
+                let issue = startup_issue("browser", &message).unwrap_or_else(|| {
+                    let mut issue = Issue::new("browser", "browser_operation_failed", message);
+                    issue.next_action=Some("Inspect the session status; refresh element references with browser inspect after navigation or DOM changes".into());
+                    issue
+                });
                 run.errors.push(issue);
             }
             Err(_) => {
@@ -561,10 +577,16 @@ struct Runtime {
     _directory: tempfile::TempDir,
 }
 
+enum RuntimeState {
+    Cold,
+    Running(Runtime),
+    Failed(String),
+}
+
 #[derive(Clone)]
 pub struct Renderer {
     config: Config,
-    runtime: Arc<Mutex<Option<Runtime>>>,
+    runtime: Arc<Mutex<RuntimeState>>,
     permits: Arc<Semaphore>,
     pub session: Option<String>,
     pub wait_for: Option<String>,
@@ -574,7 +596,7 @@ impl Renderer {
     pub fn new(config: Config, session: Option<String>, wait_for: Option<String>) -> Self {
         Self {
             config,
-            runtime: Arc::new(Mutex::new(None)),
+            runtime: Arc::new(Mutex::new(RuntimeState::Cold)),
             permits: Arc::new(Semaphore::new(2)),
             session,
             wait_for,
@@ -599,7 +621,7 @@ impl Renderer {
         }
         let endpoint = {
             let mut runtime = self.runtime.lock().await;
-            if runtime.is_none() {
+            if matches!(*runtime, RuntimeState::Cold) {
                 let executable = self
                     .config
                     .executable()
@@ -607,7 +629,7 @@ impl Renderer {
                 let directory = tempfile::Builder::new()
                     .prefix("ffetch-browser-")
                     .tempdir()?;
-                let (process, state) = session::launch(
+                let launched = session::launch(
                     &executable,
                     directory.path(),
                     false,
@@ -615,14 +637,23 @@ impl Renderer {
                     self.config.max_bytes,
                     self.config.no_sandbox,
                 )
-                .await?;
-                *runtime = Some(Runtime {
-                    _process: process,
-                    endpoint: state.endpoint,
-                    _directory: directory,
-                });
+                .await;
+                *runtime = match launched {
+                    Ok((process, state)) => RuntimeState::Running(Runtime {
+                        _process: process,
+                        endpoint: state.endpoint,
+                        _directory: directory,
+                    }),
+                    Err(error) => RuntimeState::Failed(format!("{error:#}")),
+                };
             }
-            runtime.as_ref().unwrap().endpoint.clone()
+            match &*runtime {
+                RuntimeState::Running(runtime) => runtime.endpoint.clone(),
+                RuntimeState::Failed(message) => {
+                    return Err(anyhow!("browser unavailable for this run: {message}"));
+                }
+                RuntimeState::Cold => unreachable!(),
+            }
         };
         let mut cdp = Cdp::connect(&endpoint, self.config.timeout, self.config.max_bytes).await?;
         let target = cdp

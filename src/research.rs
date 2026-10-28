@@ -62,21 +62,27 @@ fn decode_path(path: &str) -> Option<String> {
 }
 
 pub fn initialize(record: &mut Record) {
+    let queries = record.native.get("discovery_queries").cloned();
     let evidence = json!({"provider":record.source,"record":record});
     record.native = json!({"research_origins":[evidence]});
+    if let Some(queries) = queries {
+        record.native["discovery_queries"] = queries;
+    }
     record.metrics["metadata_source_count"] = json!(1);
 }
 
 pub fn merge(existing: &mut Record, incoming: Record) {
+    let queries = crate::model::combined_queries(existing, &incoming);
     let id = existing.id.clone();
     let mut origins = existing.native["research_origins"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    if !origins
-        .iter()
-        .any(|o| o["provider"] == incoming.source && o["record"]["url"] == incoming.url)
-    {
+    if !origins.iter().any(|o| {
+        o["provider"] == incoming.source
+            && o["record"]["url"] == incoming.url
+            && o["record"]["provenance"]["source_url"] == incoming.provenance.source_url
+    }) {
         origins.push(json!({"provider":incoming.source,"record":incoming}));
     }
     origins.sort_by(|a, b| {
@@ -146,6 +152,9 @@ pub fn merge(existing: &mut Record, incoming: Record) {
     );
     selected.metrics["metadata_record_count"] = json!(origins.len());
     selected.native = json!({"research_origins":origins,"field_sources":fields,"conflicts":conflicts,"independent_corroboration":false});
+    if !queries.is_empty() {
+        selected.native["discovery_queries"] = json!(queries);
+    }
     *existing = selected;
 }
 fn priority(source: &str) -> (u8, &str) {

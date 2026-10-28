@@ -228,7 +228,7 @@ async fn page(http: &Http, url: Url, run: &mut Run) -> Result<String> {
         *last = Some(Instant::now());
     }
     let start = Instant::now();
-    let response = http.get(url.clone()).await;
+    let response = http.get_once(url.clone()).await;
     drop(guard);
     run.attempts.push(Attempt {
         source: "arxiv".into(),

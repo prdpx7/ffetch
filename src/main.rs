@@ -56,6 +56,9 @@ struct Cli {
     /// Ordered engines for deep web search; the first is the preferred engine.
     #[arg(long, global = true, value_delimiter = ',')]
     engines: Vec<String>,
+    /// Maximum result pages per named HTML engine (1-20); stops at --limit.
+    #[arg(long, global = true, default_value="1", value_parser=clap::value_parser!(u32).range(1..=20))]
+    search_pages: u32,
     /// Reservoir-sample at most N output records; original saved run retains all.
     #[arg(long, global = true, value_parser = parse_positive)]
     sample: Option<usize>,
@@ -79,6 +82,9 @@ struct Cli {
     /// Maximum concurrent requests within a batch/provider.
     #[arg(long, global=true, default_value="8", value_parser=parse_positive)]
     concurrency: usize,
+    /// Maximum simultaneous HTTP requests per origin, within --concurrency.
+    #[arg(long, global=true, default_value="4", value_parser=parse_positive)]
+    origin_concurrency: usize,
     /// Maximum decompressed bytes per response.
     #[arg(long, global=true, default_value="16777216", value_parser=parse_positive)]
     max_bytes: usize,
@@ -106,6 +112,15 @@ enum Command {
     /// Search multiple sources concurrently; returns evidence and provider failures.
     Search {
         query: String,
+        /// Additional query variant; repeat this flag to search several together.
+        #[arg(long = "query")]
+        queries: Vec<String>,
+        /// Maximum query/source pairs; pagination and HTTP retries are separate.
+        #[arg(long, default_value="32", value_parser=parse_positive)]
+        max_searches: usize,
+        /// Print the query/source plan without network requests or saved files.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long, value_delimiter = ',', default_value = "web,hn")]
         sources: Vec<String>,
         #[arg(long, default_value="20", value_parser=parse_positive)]
@@ -247,6 +262,35 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse_from(args);
     let result = (|| {
+        if let Command::Search {
+            query,
+            queries,
+            sources,
+            max_searches,
+            ..
+        } = &cli.command
+        {
+            let mode = if cli.deep {
+                SearchMode::Deep
+            } else {
+                cli.search_mode
+            };
+            let sources = discovery::plan(
+                sources,
+                &cli.engines,
+                mode,
+                std::env::var("FFETCH_SEARXNG_URL").is_ok(),
+            )?;
+            discovery::query_plan(query, queries, &sources, *max_searches)?;
+        }
+        ensure!(
+            cli.search_pages == 1 || matches!(cli.command, Command::Search { .. }),
+            "--search-pages applies to search"
+        );
+        ensure!(
+            cli.search_pages == 1 || cli.deep || cli.search_mode != SearchMode::Fast,
+            "--search-pages requires balanced or deep search mode"
+        );
         ensure!(
             cli.sample.is_none()
                 || matches!(
@@ -290,6 +334,36 @@ fn execute_local(cli: &Cli, query: &query::Query) -> Result<Option<u8>> {
     }
     let store = Store::new(data_dir(cli)?);
     match &cli.command {
+        Command::Search {
+            query: primary,
+            queries,
+            sources,
+            max_searches,
+            dry_run: true,
+            limit,
+            ..
+        } => {
+            let mode = if cli.deep {
+                SearchMode::Deep
+            } else {
+                cli.search_mode
+            };
+            let sources = discovery::plan(
+                sources,
+                &cli.engines,
+                mode,
+                std::env::var("FFETCH_SEARXNG_URL").is_ok(),
+            )?;
+            let plan = discovery::query_plan(primary, queries, &sources, *max_searches)?;
+            let mut value = serde_json::to_value(plan)?;
+            value["schema"] = json!(model::SCHEMA_VERSION);
+            value["operation"] = json!("search_plan");
+            value["max_searches"] = json!(max_searches);
+            value["limit_per_query_source"] = json!(limit);
+            value["page_budget"] = json!(cli.search_pages);
+            output(cli, query, value)?;
+            return Ok(Some(0));
+        }
         Command::Query { input } => {
             let value = if uuid::Uuid::parse_str(input).is_ok() {
                 serde_json::to_value(store.load(input)?)?
@@ -329,10 +403,11 @@ fn execute_local(cli: &Cli, query: &query::Query) -> Result<Option<u8>> {
 async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
     let store = Store::new(data_dir(cli)?);
     let timeout = Duration::from_secs(u64::try_from(cli.timeout)?);
-    let http = Http::new(
-        Duration::from_secs(15).min(timeout),
+    let http = Http::with_limits(
+        timeout,
         cli.max_bytes,
         cli.concurrency,
+        cli.origin_concurrency,
     )?;
     let browser_config = browser::Config {
         root: data_dir(cli)?,
@@ -371,6 +446,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
             .map(|s| net::normalize(&s))
             .transpose()?,
         concurrency: cli.concurrency,
+        web_pages: cli.search_pages as usize,
         budget: timeout,
         youtube_region: cli.region.clone(),
         reddit_community: match &cli.command {
@@ -553,6 +629,9 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
         }
         Command::Search {
             query,
+            queries,
+            max_searches,
+            dry_run: _,
             sources,
             limit,
             since,
@@ -577,10 +656,32 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
             run.meta["preferred_engine"] =
                 json!(planned.iter().find_map(|s| s.strip_prefix("engine:")));
             run.meta["search_mode"] = json!(format!("{search_mode:?}").to_lowercase());
+            let query_plan = discovery::query_plan(query, queries, &planned, *max_searches)?;
+            run.meta["query_plan"] = json!(query_plan);
+            run.meta["max_searches"] = json!(max_searches);
             let mut fusion = Fusion::default();
-            let tasks = planned
+            let stream_pages = *read || live.enabled();
+            let (progress, mut pages) = tokio::sync::mpsc::channel(cli.concurrency.clamp(1, 32));
+            let tasks = query_plan
+                .jobs
                 .iter()
-                .map(|source| providers.search(source, query, *limit, since));
+                .map(|job| {
+                    let source = &job.source;
+                    let query = &query_plan.queries[job.query_index];
+                    let progress = stream_pages.then(|| progress.clone());
+                    let providers = &providers;
+                    async move {
+                        if let Some(progress) = progress {
+                            providers
+                                .search_with_progress(source, query, *limit, since, progress)
+                                .await
+                        } else {
+                            providers.search(source, query, *limit, since).await
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            drop(progress);
             let mut searches = stream::iter(tasks).buffer_unordered(cli.concurrency);
             let mut documents = futures::stream::FuturesUnordered::new();
             let mut targets: std::collections::VecDeque<(String, String)> =
@@ -588,6 +689,8 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
             let mut seen = std::collections::HashSet::new();
             let mut coverage = Vec::new();
             let mut searching = true;
+            let mut receiving_pages = stream_pages;
+            let mut received_ids = std::collections::HashSet::new();
             loop {
                 while documents.len() < cli.concurrency {
                     let Some((parent, url)) = targets.pop_front() else {
@@ -611,25 +714,21 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                         .boxed_local(),
                     );
                 }
-                if !searching && documents.is_empty() && targets.is_empty() {
+                if !searching && !receiving_pages && documents.is_empty() && targets.is_empty() {
                     break;
                 }
+                let mut discovered = Vec::new();
                 tokio::select! {
                     child = searches.next(), if searching => {
-                        let Some(child) = child else { searching = false; continue; };
-                        coverage.push(json!({"status":child.status,"meta":child.meta}));
-                        let changed = fusion.merge(&mut run, child);
-                        for &index in &changed {
-                            live.upserts(&run.run_id, &run.items[index..index+1], &cli.fields)?;
-                        }
-                        if *read {
-                            for index in changed {
-                                let record = &run.items[index];
-                                let url = record.content["article_url"].as_str().unwrap_or(&record.url);
-                                if seen.insert(ffetch::research::identity(record).unwrap_or_else(|| extract::canonical(url))) {
-                                    targets.push_back((record.id.clone(), url.to_owned()));
-                                }
-                            }
+                        let Some(mut child) = child else { searching = false; continue; };
+                        coverage.push(json!({"status":child.status,"meta":child.meta,"errors":child.errors}));
+                        discovered = std::mem::take(&mut child.items);
+                        run.merge(child);
+                    }
+                    page = pages.recv(), if receiving_pages => {
+                        match page {
+                            Some(records) => discovered = records,
+                            None => receiving_pages = false,
                         }
                     }
                     document = documents.next(), if !documents.is_empty() => {
@@ -640,6 +739,34 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                             }
                             live.records(&run.run_id, &fetched.items, &cli.fields)?;
                             run.merge(fetched);
+                        }
+                    }
+                }
+                // The terminal provider run is authoritative and also contains
+                // pages already delivered. Stable IDs prevent duplicate events,
+                // while retaining any page whose send was cut short by timeout.
+                if stream_pages {
+                    discovered.retain(|r| {
+                        r.kind != "search_result"
+                            || r.source != "web"
+                            || received_ids.insert(r.id.clone())
+                    });
+                }
+                let changed = fusion.merge_records(&mut run, discovered);
+                for &index in &changed {
+                    live.upserts(&run.run_id, &run.items[index..index + 1], &cli.fields)?;
+                }
+                if *read {
+                    for index in changed {
+                        let record = &run.items[index];
+                        let url = record.content["article_url"]
+                            .as_str()
+                            .unwrap_or(&record.url);
+                        if seen.insert(
+                            ffetch::research::identity(record)
+                                .unwrap_or_else(|| extract::canonical(url)),
+                        ) {
+                            targets.push_back((record.id.clone(), url.to_owned()));
                         }
                     }
                 }
@@ -715,6 +842,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
         }
         _ => unreachable!(),
     };
+    run.meta["http"] = serde_json::to_value(providers.http.stats())?;
     run.finish(start.elapsed().as_millis() as u64);
     if !cli.no_store {
         store.save(&run)?;
@@ -939,10 +1067,20 @@ fn output(cli: &Cli, query: &query::Query, mut value: Value) -> Result<()> {
                             let engines = origins
                                 .iter()
                                 .filter_map(|o| o["engine"].as_str())
-                                .collect::<Vec<_>>();
+                                .collect::<std::collections::BTreeSet<_>>();
                             if !engines.is_empty() {
-                                writeln!(out, "Found by: {}", engines.join(", "))?;
+                                writeln!(
+                                    out,
+                                    "Found by: {}",
+                                    engines.into_iter().collect::<Vec<_>>().join(", ")
+                                )?;
                             }
+                        }
+                        if let Some(queries) = item["native"]["discovery_queries"]
+                            .as_array()
+                            .filter(|q| q.len() > 1)
+                        {
+                            writeln!(out, "Queries: {}", serde_json::to_string(queries)?)?;
                         }
                         if let Some(time) = item["provenance"]["captured_at"].as_str() {
                             writeln!(out, "[Historical capture: {time}]")?;
@@ -1047,7 +1185,9 @@ fn write_csv(out: &mut impl Write, value: &Value) -> Result<()> {
 fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
-        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":"first search page","default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":false},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "search_planning":{"explicit_query_variants":true,"query_flag":"--query","dry_run":true,"default_max_searches":32,"limit_scope":"per query and source","automatic_expansion":false,"iterative_planning":false,"engine_agreement":"best observed rank per engine across queries"},
+        "http":{"global_concurrency_default":8,"origin_concurrency_default":4,"origin_flag":"--origin-concurrency","attempt_timeout_seconds":15,"redirect_limit":10,"redirect_origin_limits":true,"retry_after":{"statuses":[429,503],"max_retries_per_get":1,"valid_header_required":true,"remaining_budget":true,"redirect_delays":true,"cross_process_coordination":false},"telemetry":"meta.http","browser_network_scheduled":false},
         "browser":{"backend":"chromium-cdp","optional_runtime":true,"sessions":true,"navigation":true,"inspection_refs":true,"click_fill_press":true,"screenshots":true,"document_fallback":true,"search_engine_fallback":true},
         "research_identity":{"doi_merge":true,"ascii_case_folding":true,"original_provider_records":true,"field_sources":true,"conflicts":true,"title_based_identity":false,"independent_corroboration_claim":false},
         "query":{"jq":"embedded jaq; not a promise of complete jq compatibility","jmespath":true,"css":true,"fields":true},

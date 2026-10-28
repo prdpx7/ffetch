@@ -4,7 +4,7 @@ use crate::{
     net::Http,
 };
 use anyhow::{Result, anyhow, ensure};
-use futures::{StreamExt, stream};
+use futures::{StreamExt, stream, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
@@ -23,17 +23,36 @@ pub struct Providers {
     pub brave_search: Url,
     pub searxng: Option<Url>,
     pub concurrency: usize,
+    pub web_pages: usize,
     pub budget: Duration,
     pub reddit_community: Option<String>,
     pub youtube_region: String,
 }
 
 fn issue(source: &str, e: impl std::fmt::Display) -> Issue {
-    let mut issue = Issue::new(source, "provider_failed", e.to_string());
+    let message = e.to_string();
+    if let Some(issue) = crate::browser::startup_issue(source, &message) {
+        return issue;
+    }
+    let code = if message.contains("HTTP 429") {
+        "rate_limited"
+    } else if message.contains("HTTP 503") {
+        "service_unavailable"
+    } else if message.contains("Retry-After") {
+        "origin_cooldown"
+    } else {
+        "provider_failed"
+    };
+    let mut issue = Issue::new(source, code, message);
     issue.retryable = true;
-    issue.next_action = Some(
-        "Retry this provider or select another source; successful records remain available".into(),
-    );
+    issue.next_action = if code != "provider_failed" {
+        Some("Inspect meta.http.origins[].cooldown_remaining_ms before retrying; use another source while this origin is cooling down".into())
+    } else {
+        Some(
+            "Retry this provider or select another source; successful records remain available"
+                .into(),
+        )
+    };
     issue
 }
 
@@ -70,10 +89,24 @@ fn hn_record(item: Value) -> Result<Record> {
     Ok(record)
 }
 
+fn engine_origins(items: &mut [Record], engine: &str, query: &str) {
+    for (index, item) in items.iter_mut().enumerate() {
+        let native = std::mem::replace(&mut item.native, json!({}));
+        let rank = native["search_page"]["observed_rank"]
+            .as_u64()
+            .unwrap_or((index + 1) as u64);
+        item.native = json!({"provider_data":native,"discovery_queries":[query],"origins":[{"engine":engine,"rank":rank,"rank_basis":"observed-result-order","query":query,"url":item.url,"title":item.title,"snippet":item.text,"provenance":item.provenance}]});
+    }
+}
+
 impl Providers {
     async fn hn_item(&self, id: u64) -> Result<Record> {
         let url = self.hn_base.join(&format!("item/{id}.json"))?;
         let mut record = hn_record(self.http.json(url.clone()).await?)?;
+        ensure!(
+            record.native["id"].as_u64() == Some(id),
+            "HN response ID does not match requested item {id}"
+        );
         record.provenance.source_url = url.into();
         Ok(record)
     }
@@ -122,7 +155,7 @@ impl Providers {
             }
             Ok(())
         };
-        match tokio::time::timeout(self.budget, task).await {
+        match crate::net::within_budget(self.budget, task).await {
             Ok(Ok(())) => (),
             Ok(Err(e)) => run.errors.push(issue("hn", e)),
             Err(_) => run.errors.push(issue(
@@ -141,47 +174,70 @@ impl Providers {
         let mut run = Run::new("fetch");
         run.meta =
             json!({"source":"hn","item_id":id,"comments_requested":comments,"comment_limit":limit});
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::from([id]);
+        let mut attempted = 0;
+        let mut completed = 0;
+        let mut failed = 0;
+        let mut root_loaded = false;
         let task = async {
             let root = self.hn_item(id).await?;
-            let mut queue = VecDeque::new();
-            enqueue_children(&root, &mut queue);
+            root_loaded = true;
+            enqueue_children(&root, &mut queue, &mut visited);
             run.items.push(root);
-            let mut visited = HashSet::from([id]);
-            let mut attempted = 0;
-            while comments && !queue.is_empty() && attempted < limit {
-                let take = self.concurrency.min(limit - attempted);
-                let batch = (0..take)
-                    .filter_map(|_| queue.pop_front())
-                    .filter(|id| visited.insert(*id))
-                    .collect::<Vec<_>>();
-                attempted += batch.len();
-                let mut pending = stream::iter(batch.into_iter().map(|id| self.hn_item(id)))
-                    .buffer_unordered(self.concurrency);
-                while let Some(result) = pending.next().await {
-                    match result {
-                        Ok(record) => {
-                            enqueue_children(&record, &mut queue);
-                            run.items.push(record);
-                        }
-                        Err(e) => run.errors.push(issue("hn", e)),
+            let mut pending = FuturesUnordered::new();
+            while comments && (!queue.is_empty() || !pending.is_empty()) {
+                while pending.len() < self.concurrency.max(1) && attempted < limit {
+                    let Some(child) = queue.pop_front() else {
+                        break;
+                    };
+                    attempted += 1;
+                    pending.push(self.hn_item(child));
+                }
+                let Some(result) = pending.next().await else {
+                    break;
+                };
+                completed += 1;
+                match result {
+                    Ok(record) => {
+                        enqueue_children(&record, &mut queue, &mut visited);
+                        run.items.push(record);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        run.errors.push(issue("hn", e));
                     }
                 }
             }
-            run.meta["comments_truncated"] = json!(comments && !queue.is_empty());
-            if comments && !queue.is_empty() {
-                run.warnings.push(format!(
-                    "Comment traversal reached --limit {limit}; additional comments remain"
-                ));
-            }
             Ok::<(), anyhow::Error>(())
         };
-        match tokio::time::timeout(self.budget, task).await {
+        match crate::net::within_budget(self.budget, task).await {
             Ok(Ok(())) => (),
             Ok(Err(e)) => run.errors.push(issue("hn", e)),
             Err(_) => run.errors.push(issue(
                 "hn",
                 "thread deadline exceeded; partial comment tree retained",
             )),
+        }
+        let in_flight = attempted - completed;
+        let truncated = comments && (!queue.is_empty() || in_flight > 0);
+        run.meta["comment_attempts"] = json!(attempted);
+        run.meta["comments_returned"] = json!(completed - failed);
+        run.meta["comment_failures"] = json!(failed);
+        run.meta["comments_pending"] = json!(if comments { queue.len() } else { 0 });
+        run.meta["comments_in_flight"] = json!(in_flight);
+        run.meta["comments_truncated"] = json!(truncated);
+        run.meta["comments_coverage"] = json!(if !comments {
+            "not_requested"
+        } else if root_loaded && !truncated && failed == 0 {
+            "complete"
+        } else {
+            "incomplete"
+        });
+        if comments && attempted >= limit && !queue.is_empty() {
+            run.warnings.push(format!(
+                "Comment traversal reached --limit {limit}; additional comments remain"
+            ));
         }
         run.finish(start.elapsed().as_millis() as u64);
         run
@@ -190,7 +246,7 @@ impl Providers {
     pub async fn reddit_feed(&self, feed: &str, period: &str, limit: usize) -> Run {
         let start = Instant::now();
         let mut run = Run::new("trends");
-        match tokio::time::timeout(
+        match crate::net::within_budget(
             self.budget,
             crate::reddit::feed(
                 &self.http,
@@ -216,7 +272,7 @@ impl Providers {
     pub async fn reddit_thread(&self, id: &str, comments: bool, limit: usize) -> Run {
         let start = Instant::now();
         let mut run = Run::new("thread");
-        match tokio::time::timeout(
+        match crate::net::within_budget(
             self.budget,
             crate::reddit::thread(&self.http, id, comments, limit, &mut run),
         )
@@ -234,6 +290,32 @@ impl Providers {
     }
 
     pub async fn search(&self, source: &str, query: &str, limit: usize, since: Option<i64>) -> Run {
+        self.search_inner(source, query, limit, since, None).await
+    }
+
+    /// Completed named-engine pages are sent through the caller's bounded
+    /// channel. The terminal run still includes every record, with identical
+    /// IDs, so a caller can recover records not delivered before a deadline.
+    pub async fn search_with_progress(
+        &self,
+        source: &str,
+        query: &str,
+        limit: usize,
+        since: Option<i64>,
+        progress: tokio::sync::mpsc::Sender<Vec<Record>>,
+    ) -> Run {
+        self.search_inner(source, query, limit, since, Some(progress))
+            .await
+    }
+
+    async fn search_inner(
+        &self,
+        source: &str,
+        query: &str,
+        limit: usize,
+        since: Option<i64>,
+        progress: Option<tokio::sync::mpsc::Sender<Vec<Record>>>,
+    ) -> Run {
         let start = Instant::now();
         let mut run = Run::new("search");
         run.meta = json!({"source":source,"query":query,"limit":limit});
@@ -249,21 +331,32 @@ impl Providers {
                 }
                 "web" => self.search_web(query, limit, since, &mut run).await,
                 engine if engine.starts_with("engine:") => {
-                    self.search_engine_query(&engine[7..], query, limit, &mut run)
-                        .await
+                    self.search_engine_query_progress(
+                        &engine[7..],
+                        query,
+                        limit,
+                        &mut run,
+                        progress.as_ref(),
+                    )
+                    .await
                 }
                 _ => Err(anyhow!(
                     "unsupported source {source}; supported sources: web, hn, reddit, youtube, arxiv, crossref, europepmc, pubmed"
                 )),
             }
         };
-        match tokio::time::timeout(self.budget, task).await {
+        match crate::net::within_budget(self.budget, task).await {
             Ok(Ok(())) => (),
             Ok(Err(e)) => run.errors.push(issue(source, e)),
-            Err(_) => run.errors.push(issue(
-                source,
-                "search deadline exceeded; partial results retained",
-            )),
+            Err(_) => {
+                if run.meta["web_pagination"].is_object() {
+                    run.meta["web_pagination"]["stop_reason"] = json!("deadline");
+                }
+                run.errors.push(issue(
+                    source,
+                    "search deadline exceeded; partial results retained",
+                ));
+            }
         }
         if let Some(engine) = source.strip_prefix("engine:") {
             run.meta["engine"] = json!(engine);
@@ -271,9 +364,13 @@ impl Providers {
                 run.warnings
                     .push(format!("{engine} does not enforce --since"));
             }
-            for (index, item) in run.items.iter_mut().enumerate() {
-                let native = std::mem::replace(&mut item.native, json!({}));
-                item.native = json!({"provider_data":native,"origins":[{"engine":engine,"rank":index+1,"query":query,"url":item.url,"title":item.title,"snippet":item.text,"provenance":item.provenance}]});
+            engine_origins(&mut run.items, engine, query);
+        } else {
+            for record in &mut run.items {
+                if !record.native.is_object() {
+                    record.native = json!({"provider_data":record.native});
+                }
+                record.native["discovery_queries"] = json!([query]);
             }
         }
         run.finish(start.elapsed().as_millis() as u64);
@@ -283,7 +380,7 @@ impl Providers {
     pub async fn arxiv_paper(&self, id: &str) -> Run {
         let start = Instant::now();
         let mut run = Run::new("fetch");
-        match tokio::time::timeout(self.budget, crate::arxiv::lookup(&self.http, id, &mut run))
+        match crate::net::within_budget(self.budget, crate::arxiv::lookup(&self.http, id, &mut run))
             .await
         {
             Ok(Ok(())) => (),
@@ -300,7 +397,7 @@ impl Providers {
     pub async fn youtube_video(&self, id: &str, language: Option<&str>) -> Run {
         let start = Instant::now();
         let mut run = Run::new("fetch");
-        match tokio::time::timeout(
+        match crate::net::within_budget(
             self.budget,
             crate::youtube::video(&self.http, id, language, &mut run),
         )
@@ -319,7 +416,7 @@ impl Providers {
     pub async fn youtube_popular(&self, limit: usize) -> Run {
         let start = Instant::now();
         let mut run = Run::new("trends");
-        match tokio::time::timeout(
+        match crate::net::within_budget(
             self.budget,
             crate::youtube::popular(&self.http, &self.youtube_region, limit, &mut run),
         )
@@ -473,8 +570,116 @@ impl Providers {
         limit: usize,
         run: &mut Run,
     ) -> Result<()> {
+        self.search_engine_query_progress(engine, query, limit, run, None)
+            .await
+    }
+
+    async fn search_engine_query_progress(
+        &self,
+        engine: &str,
+        query: &str,
+        limit: usize,
+        run: &mut Run,
+        progress: Option<&tokio::sync::mpsc::Sender<Vec<Record>>>,
+    ) -> Result<()> {
+        let supported = matches!(engine, "brave" | "bing" | "google");
+        let pages = if supported {
+            self.web_pages.clamp(1, 20)
+        } else {
+            1
+        };
+        run.meta["web_pagination"] = json!({"page_budget":pages,"pages_requested":0,"pages_completed":0,"stop_reason":"in_progress","coverage":"bounded","pages":[]});
+        let mut next = None;
+        let mut seen = HashSet::new();
+        let mut observed = 0;
+        for page in 0..pages {
+            run.meta["web_pagination"]["pages_requested"] = json!(page + 1);
+            let mut branch = Run::new("search");
+            let result = self
+                .search_engine_page(engine, query, limit, next.as_ref(), &mut branch)
+                .await;
+            let next_url = branch.meta["next_page_url"]
+                .as_str()
+                .map(Url::parse)
+                .transpose()?;
+            let pagination_error = branch.meta["pagination_error"].as_str().map(str::to_owned);
+            let before = run.items.len();
+            for (index, item) in branch.items.iter_mut().enumerate() {
+                if !item.native.is_object() {
+                    item.native = json!({});
+                }
+                item.native["search_page"] =
+                    json!({"number":page+1,"position":index+1,"observed_rank":observed+index+1});
+            }
+            observed += branch.items.len();
+            branch
+                .items
+                .retain(|item| seen.insert(extract::canonical(&item.url)));
+            branch.items.truncate(limit.saturating_sub(run.items.len()));
+            // Preserve each page's provenance and route before Run::merge, which
+            // deliberately does not overwrite parent metadata.
+            run.meta["web_pagination"]["pages"].as_array_mut().unwrap().push(json!({"page":page+1,"meta":branch.meta,"status":if result.is_ok(){"ok"}else{"error"}}));
+            run.meta["search_url"] = branch.meta["search_url"].clone();
+            run.meta["retrieval_route"] = branch.meta["retrieval_route"].clone();
+            run.merge(branch);
+            if result.is_ok() {
+                run.meta["web_pagination"]["pages_completed"] = json!(page + 1);
+            }
+            if let Some(progress) = progress.filter(|_| run.items.len() > before) {
+                let mut records = run.items[before..].to_vec();
+                engine_origins(&mut records, engine, query);
+                progress
+                    .send(records)
+                    .await
+                    .map_err(|_| anyhow!("search progress receiver closed"))?;
+            }
+            if let Err(error) = result {
+                run.meta["web_pagination"]["stop_reason"] = json!("page_failed");
+                return Err(error);
+            }
+            if pages > page + 1
+                && run.items.len() < limit
+                && let Some(error) = pagination_error
+            {
+                run.meta["web_pagination"]["stop_reason"] = json!("pagination_rejected");
+                let mut issue =
+                    Issue::new(&format!("engine:{engine}"), "pagination_rejected", error);
+                issue.next_action = Some("Use retained results, inspect the engine's pagination markup, or select another engine; the rejected link was not fetched".into());
+                run.errors.push(issue);
+                return Ok(());
+            }
+            let stop = if run.items.len() >= limit {
+                Some("result_limit")
+            } else if !supported {
+                Some("pagination_unsupported")
+            } else if page + 1 == pages {
+                Some("page_budget")
+            } else if next_url.is_none() {
+                Some("no_recognized_next_link")
+            } else if run.items.len() == before {
+                Some("no_new_results")
+            } else {
+                None
+            };
+            if let Some(reason) = stop {
+                run.meta["web_pagination"]["stop_reason"] = json!(reason);
+                break;
+            }
+            next = next_url;
+        }
+        Ok(())
+    }
+
+    async fn search_engine_page(
+        &self,
+        engine: &str,
+        query: &str,
+        limit: usize,
+        page_url: Option<&Url>,
+        run: &mut Run,
+    ) -> Result<()> {
         let start = Instant::now();
-        let result = crate::engines::search(self, engine, query, limit, run).await;
+        let result = crate::engines::search_at(self, engine, query, limit, page_url, run).await;
         let route = if self.browser_only { "browser" } else { "http" };
         run.meta["retrieval_route"] = json!(route);
         run.attempts.push(crate::model::Attempt {
@@ -496,7 +701,12 @@ impl Providers {
             return result;
         }
         let message = result.as_ref().unwrap_err().to_string();
-        if message.contains("429") || message.contains("404") || message.contains("410") {
+        if message.contains("429")
+            || message.contains("503")
+            || message.contains("Retry-After")
+            || message.contains("404")
+            || message.contains("410")
+        {
             return result;
         }
         let Some(renderer) = self.browser.as_ref().filter(|r| r.available()) else {
@@ -507,9 +717,16 @@ impl Providers {
         rendered_provider.browser = Some(renderer.clone());
         let start = Instant::now();
         let mut branch = Run::new("search");
-        let rendered = tokio::time::timeout(
+        let rendered = crate::net::within_budget(
             self.budget.mul_f64(0.7),
-            crate::engines::search(&rendered_provider, engine, query, limit, &mut branch),
+            crate::engines::search_at(
+                &rendered_provider,
+                engine,
+                query,
+                limit,
+                page_url,
+                &mut branch,
+            ),
         )
         .await;
         let outcome = match rendered {
@@ -535,6 +752,9 @@ impl Providers {
                     "{engine} HTTP route failed ({message}); recovered using rendered DOM"
                 ));
                 run.meta["retrieval_route"] = json!("browser-dom");
+                run.meta["search_url"] = branch.meta["search_url"].clone();
+                run.meta["next_page_url"] = branch.meta["next_page_url"].clone();
+                run.meta["pagination_error"] = branch.meta["pagination_error"].clone();
                 run.merge(branch);
                 Ok(())
             }
@@ -618,7 +838,7 @@ impl Providers {
         }
         if self.searxng.is_some() {
             let mut branch = Run::new("search");
-            let result = tokio::time::timeout(
+            let result = crate::net::within_budget(
                 self.budget.min(Duration::from_secs(3)),
                 crate::engines::search(self, "searxng", query, limit, &mut branch),
             )
@@ -642,6 +862,11 @@ impl Providers {
         // Start the currently successful lightweight route first. Hedge after 300 ms
         // so a stalled provider cannot consume the whole search deadline. Dropping
         // `pending` cancels unfinished requests after a validated result arrives.
+        let fast = Self {
+            web_pages: 1,
+            ..self.clone()
+        };
+        let fast = &fast;
         let tasks =
             [("brave", 0), ("duckduckgo", 300)]
                 .into_iter()
@@ -653,11 +878,11 @@ impl Providers {
                     let start = Instant::now();
                     let result = match source {
                         "brave" => {
-                            self.search_engine_query("brave", query, limit, &mut branch)
+                            fast.search_engine_query("brave", query, limit, &mut branch)
                                 .await
                         }
                         _ => {
-                            self.search_engine_query("duckduckgo", query, limit, &mut branch)
+                            fast.search_engine_query("duckduckgo", query, limit, &mut branch)
                                 .await
                         }
                     };
@@ -692,11 +917,15 @@ impl Providers {
         &self,
         query: &str,
         limit: usize,
+        page_url: Option<&Url>,
         run: &mut Run,
     ) -> Result<()> {
         let mut url = self.brave_search.clone();
         url.query_pairs_mut()
             .extend_pairs([("q", query), ("source", "web")]);
+        if let Some(page_url) = page_url {
+            url = page_url.clone();
+        }
         run.meta["search_url"] = json!(url.as_str());
         let response = self.search_response(url).await?;
         ensure!(
@@ -747,6 +976,11 @@ impl Providers {
             !run.items.is_empty(),
             "no recognized organic results; possible challenge, empty results, or changed markup"
         );
+        if let Err(error) =
+            crate::engines::record_next_page("brave", &doc, &response.url, query, run)
+        {
+            run.meta["pagination_error"] = json!(error.to_string());
+        }
         Ok(())
     }
 
@@ -812,9 +1046,13 @@ impl Providers {
     }
 }
 
-fn enqueue_children(record: &Record, queue: &mut VecDeque<u64>) {
+fn enqueue_children(record: &Record, queue: &mut VecDeque<u64>, visited: &mut HashSet<u64>) {
     if let Some(ids) = record.content["child_ids"].as_array() {
-        queue.extend(ids.iter().filter_map(Value::as_u64));
+        queue.extend(
+            ids.iter()
+                .filter_map(Value::as_u64)
+                .filter(|id| visited.insert(*id)),
+        );
     }
 }
 

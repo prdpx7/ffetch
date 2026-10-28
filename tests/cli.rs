@@ -365,6 +365,162 @@ fn hn_feed_order_and_comment_tree_preserve_native_fields() {
 }
 
 #[test]
+fn hn_thread_schedules_descendants_while_a_sibling_is_pending() {
+    let descendant_started = Arc::new(AtomicBool::new(false));
+    let slow_finished = Arc::new(AtomicBool::new(false));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let started = descendant_started.clone();
+    let finished = slow_finished.clone();
+    let overlap = overlapped.clone();
+    let fixture = Fixture::new(move |path| {
+        let data = match path {
+            "/v0/item/1.json" => json!({"id":1,"type":"story","kids":[2,3,3,1]}),
+            "/v0/item/2.json" => {
+                // A batch scheduler cannot reach item 5 until this request finishes.
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !started.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                finished.store(true, Ordering::SeqCst);
+                json!({"id":2,"type":"comment","parent":1})
+            }
+            "/v0/item/3.json" => json!({"id":3,"type":"comment","parent":1,"kids":[4,2]}),
+            "/v0/item/4.json" => json!({"id":4,"type":"comment","parent":3,"kids":[5,3]}),
+            "/v0/item/5.json" => {
+                overlap.store(!finished.load(Ordering::SeqCst), Ordering::SeqCst);
+                started.store(true, Ordering::SeqCst);
+                json!({"id":5,"type":"comment","parent":4})
+            }
+            _ => panic!("unexpected or duplicate request {path}"),
+        };
+        (200, "application/json", data.to_string())
+    });
+    let output = cli(&[
+        "thread",
+        "1",
+        "--limit",
+        "4",
+        "--concurrency",
+        "2",
+        "--no-store",
+    ])
+    .env("FFETCH_HN_BASE", fixture.url("v0/"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data = parsed(&output);
+    assert!(
+        overlapped.load(Ordering::SeqCst),
+        "descendant was held behind a slow sibling"
+    );
+    let mut ids: Vec<_> = data["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["hn:1", "hn:2", "hn:3", "hn:4", "hn:5"]);
+    assert_eq!(data["meta"]["comment_attempts"], 4);
+    assert_eq!(data["meta"]["comments_coverage"], "complete");
+    assert_eq!(data["meta"]["comments_truncated"], false);
+}
+
+#[test]
+fn hn_thread_deadline_reports_pending_work_and_retains_fast_descendants() {
+    let fixture = Fixture::new(|path| {
+        let data = match path {
+            "/v0/item/1.json" => json!({"id":1,"type":"story","kids":[2,3]}),
+            "/v0/item/2.json" => {
+                thread::sleep(Duration::from_millis(1500));
+                json!({"id":2,"type":"comment","parent":1})
+            }
+            "/v0/item/3.json" => json!({"id":3,"type":"comment","parent":1,"kids":[4]}),
+            "/v0/item/4.json" => json!({"id":4,"type":"comment","parent":3,"kids":[5]}),
+            _ => panic!("request exceeded comment limit: {path}"),
+        };
+        (200, "application/json", data.to_string())
+    });
+    let output = cli(&[
+        "thread",
+        "1",
+        "--limit",
+        "3",
+        "--concurrency",
+        "2",
+        "--timeout",
+        "1",
+        "--no-store",
+    ])
+    .env("FFETCH_HN_BASE", fixture.url("v0/"))
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let data = parsed(&output);
+    assert_eq!(
+        data["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["hn:1", "hn:3", "hn:4"]
+    );
+    assert_eq!(data["meta"]["comment_attempts"], 3);
+    assert_eq!(data["meta"]["comments_returned"], 2);
+    assert_eq!(data["meta"]["comment_failures"], 0);
+    assert_eq!(data["meta"]["comments_in_flight"], 1);
+    assert_eq!(data["meta"]["comments_pending"], 1);
+    assert_eq!(data["meta"]["comments_truncated"], true);
+    assert_eq!(data["meta"]["comments_coverage"], "incomplete");
+    assert!(
+        data["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline")
+    );
+}
+
+#[test]
+fn hn_thread_rejects_mismatched_items_and_zero_limit() {
+    let fixture = Fixture::new(|path| {
+        let data = match path {
+            "/v0/item/1.json" => json!({"id":1,"type":"story","kids":[2,3,2,1]}),
+            "/v0/item/2.json" => json!({"id":999,"type":"comment","parent":1,"kids":[4]}),
+            "/v0/item/3.json" => json!({"id":3,"type":"comment","parent":1}),
+            _ => panic!("must not follow a mismatched response: {path}"),
+        };
+        (200, "application/json", data.to_string())
+    });
+    let output = cli(&["thread", "1", "--limit", "2", "--no-store"])
+        .env("FFETCH_HN_BASE", fixture.url("v0/"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let data = parsed(&output);
+    assert_eq!(data["items"].as_array().unwrap().len(), 2);
+    assert_eq!(data["meta"]["comment_attempts"], 2);
+    assert_eq!(data["meta"]["comment_failures"], 1);
+    assert_eq!(data["meta"]["comments_coverage"], "incomplete");
+    assert!(
+        data["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match")
+    );
+    let output = cli(&["thread", "1", "--limit", "0", "--no-store"])
+        .env("FFETCH_HN_BASE", fixture.url("v0/"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("greater than zero"));
+}
+
+#[test]
 fn hn_search_paginates_and_preserves_partial_provider_failure() {
     let fixture = Fixture::new(|path| {
         let second = path.contains("page=1");
@@ -558,6 +714,31 @@ fn invalid_queries_are_rejected_before_network_or_storage() {
         assert!(!absent.exists());
         assert!(String::from_utf8_lossy(&result.stderr).contains("invalid"));
     }
+    for args in [
+        vec!["search", "q", "--search-pages", "2"], // fast mode is set by cli()
+        vec![
+            "search",
+            "q",
+            "--search-mode",
+            "balanced",
+            "--search-pages",
+            "0",
+        ],
+        vec![
+            "search",
+            "q",
+            "--search-mode",
+            "balanced",
+            "--search-pages",
+            "21",
+        ],
+        vec!["capabilities", "--search-pages", "2"],
+    ] {
+        let result = cli(&args).arg("--data-dir").arg(&absent).output().unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(!absent.exists());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("--search-pages"));
+    }
     assert_eq!(requests.load(Ordering::Relaxed), 0);
 }
 
@@ -747,6 +928,8 @@ fn deep_search_fans_out_and_fuses_origins_with_stream_updates() {
         "web",
         "--search-mode",
         "deep",
+        "--origin-concurrency",
+        "8",
         "--format",
         "jsonl",
         "--no-store",
@@ -835,6 +1018,950 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
     assert_eq!(data["items"][0]["metrics"]["engine_count"], 1);
     assert_eq!(data["errors"][0]["source"], "engine:google");
     assert_eq!(data["meta"]["coverage"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn multi_query_plan_deduplicates_and_rejects_over_budget_before_io() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = Fixture::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        (200, "text/html", String::new())
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("no-data");
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        " gripper ",
+        "--query",
+        "tendon",
+        "--sources",
+        "web",
+        "--engines",
+        "bing,brave",
+        "--search-mode",
+        "balanced",
+        "--max-searches",
+        "4",
+        "--dry-run",
+        "--read",
+    ])
+    .arg("--data-dir")
+    .arg(&absent)
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .env("FFETCH_BRAVE_SEARCH", server.url("brave"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan = parsed(&output);
+    assert_eq!(plan["operation"], "search_plan");
+    assert_eq!(plan["queries"], json!(["gripper", "tendon"]));
+    assert_eq!(plan["jobs"].as_array().unwrap().len(), 4);
+    for (primary, extra, budget) in [
+        ("gripper", "tendon", "1"),
+        (" ", "tendon", "32"),
+        ("gripper", " ", "32"),
+    ] {
+        let output = cli(&[
+            "search",
+            primary,
+            "--query",
+            extra,
+            "--sources",
+            "web",
+            "--engines",
+            "bing",
+            "--search-mode",
+            "balanced",
+            "--max-searches",
+            budget,
+        ])
+        .arg("--data-dir")
+        .arg(&absent)
+        .env("FFETCH_BING_SEARCH", server.url("bing"))
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert!(!absent.exists());
+}
+
+#[test]
+fn multi_query_web_stream_fuses_origins_and_reads_each_url_once() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    let article = Fixture::new(move |_| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        (
+            200,
+            "text/html",
+            "<article>Open gripper CAD and tendon design</article>".into(),
+        )
+    });
+    let link = article.url("paper").replace("127.0.0.1", "localhost");
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = requests.clone();
+    let server = Fixture::new(move |path| {
+        started.fetch_add(1, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while started.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            started.load(Ordering::Relaxed) >= 2,
+            "query jobs were serialized"
+        );
+        let url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+        let query = url
+            .query_pairs()
+            .find(|(k, _)| k == "q")
+            .unwrap()
+            .1
+            .to_string();
+        assert!(matches!(query.as_str(), "gripper" | "tendon"));
+        (
+            200,
+            "text/html",
+            format!(
+                "<li class='b_algo'><h2><a href='{link}'>Gripper design</a></h2><div class='b_caption'><p>{query} evidence</p></div></li>"
+            ),
+        )
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "tendon",
+        "--sources",
+        "web",
+        "--engines",
+        "bing",
+        "--search-mode",
+        "balanced",
+        "--concurrency",
+        "2",
+        "--limit",
+        "1",
+        "--read",
+        "--format",
+        "jsonl",
+        "--no-store",
+    ])
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.iter().filter(|e| e["type"] == "record").count(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "record_update")
+            .count(),
+        1
+    );
+    let updated = &events
+        .iter()
+        .find(|e| e["type"] == "record_update")
+        .unwrap()["item"];
+    assert_eq!(updated["metrics"]["engine_count"], 1);
+    assert_eq!(updated["metrics"]["query_count"], 2);
+    assert_eq!(updated["metrics"]["observation_count"], 2);
+    assert_eq!(
+        updated["native"]["discovery_queries"],
+        json!(["gripper", "tendon"])
+    );
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        events.last().unwrap()["result"]["meta"]["coverage"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let doc = &events
+        .iter()
+        .find(|e| e["item"]["kind"] == "document")
+        .unwrap()["item"];
+    assert_eq!(doc["native"]["discovered_from"], updated["id"]);
+}
+
+#[test]
+fn multi_query_native_results_keep_hn_and_doi_search_observations() {
+    let server = Fixture::new(|path| {
+        let second = path.contains("tendon");
+        let data = if path.starts_with("/hn") {
+            json!({"hits":[{"objectID":"1","title":"Gripper design","points":if second {20}else{10}}],"nbPages":1,"nbHits":1})
+        } else {
+            json!({"message":{"items":[{"DOI":"10.1000/grip","title":["Gripper design"],"type":"journal-article","abstract":if second {"Tendon evidence"}else{"Gripper evidence"}}],"total-results":1,"next-cursor":"done"}})
+        };
+        (200, "application/json", data.to_string())
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "tendon",
+        "--sources",
+        "hn,crossref",
+        "--limit",
+        "1",
+        "--no-store",
+    ])
+    .env("FFETCH_HN_SEARCH", server.url("hn"))
+    .env("FFETCH_CROSSREF_SEARCH", server.url("crossref"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = parsed(&output);
+    let items = run["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(
+            item["native"]["discovery_queries"],
+            json!(["gripper", "tendon"])
+        );
+    }
+    let hn = items.iter().find(|r| r["source"] == "hn").unwrap();
+    assert_eq!(hn["id"], "hn:1");
+    let mut scores: Vec<_> = hn["native"]["search_observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["metrics"]["score"].as_u64().unwrap())
+        .collect();
+    scores.sort_unstable();
+    assert_eq!(scores, [10, 20]);
+    let paper = items.iter().find(|r| r["source"] == "crossref").unwrap();
+    assert_eq!(paper["metrics"]["metadata_source_count"], 1);
+    assert_eq!(
+        paper["native"]["research_origins"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        run["meta"]["query_plan"]["jobs"].as_array().unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn multi_query_failure_names_the_missing_query_and_keeps_successes() {
+    let server = Fixture::new(|path| {
+        if path.contains("q=unavailable") {
+            (503, "text/html", "Busy".into())
+        } else {
+            (
+                200,
+                "text/html",
+                "<li class='b_algo'><h2><a href='https://example.org/gripper'>Design</a></h2></li>"
+                    .into(),
+            )
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "unavailable",
+        "--sources",
+        "web",
+        "--engines",
+        "bing",
+        "--search-mode",
+        "balanced",
+        "--no-store",
+    ])
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 1);
+    let missing = run["meta"]["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["status"] == "error")
+        .unwrap();
+    assert_eq!(missing["meta"]["query"], "unavailable");
+    assert_eq!(missing["errors"][0]["code"], "service_unavailable");
+}
+
+#[test]
+#[ignore = "controlled latency benchmark; set FFETCH_BENCH_BIN to a release binary"]
+fn benchmark_paginated_first_record_latency() {
+    use std::io::BufRead;
+    let binary = std::env::var("FFETCH_BENCH_BIN").expect("set FFETCH_BENCH_BIN");
+    let server = Fixture::new(|path| {
+        let later = path.contains("first=");
+        if later {
+            thread::sleep(Duration::from_millis(250));
+        }
+        let link = if later { "second" } else { "first" };
+        let mut html = format!(
+            "<li class='b_algo'><h2><a href='https://example.org/{link}'>{link}</a></h2></li>"
+        );
+        if !later {
+            html += "<a class='sb_pagN' href='/bing?q=gripper&amp;first=11'>Next</a>";
+        }
+        (200, "text/html", html)
+    });
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let mut child = Command::new(&binary)
+            .args([
+                "search",
+                "gripper",
+                "--sources",
+                "web",
+                "--engines",
+                "bing",
+                "--search-pages",
+                "2",
+                "--limit",
+                "10",
+                "--browser",
+                "off",
+                "--format",
+                "jsonl",
+                "--no-store",
+            ])
+            .env("FFETCH_BING_SEARCH", server.url("bing"))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut first = None;
+        let mut count = 0;
+        let mut complete = false;
+        for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+            let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if event["type"] == "record" {
+                first.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
+                count += 1;
+            }
+            if event["type"] == "complete" {
+                assert_eq!(event["result"]["status"], "ok");
+                complete = true;
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(complete);
+        assert_eq!(count, 2);
+        samples.push(json!({"first_record_ms":first.unwrap(),"completion_ms":start.elapsed().as_secs_f64()*1000.0}));
+    }
+    println!(
+        "{}",
+        json!({"benchmark":"paginated-first-record","binary":binary,"later_page_delay_ms":250,"storage":false,"samples":samples})
+    );
+}
+
+#[test]
+fn paginated_search_streams_and_reads_first_page_before_later_failure() {
+    let release = Arc::new(AtomicBool::new(false));
+    let later_finished = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let finished = later_finished.clone();
+    let article = Fixture::new(|_| {
+        (
+            200,
+            "text/html",
+            "<article>First page research evidence</article>".into(),
+        )
+    });
+    // Organic parsers exclude the engine host; use a different loopback name.
+    let article_url = article.url("paper").replace("127.0.0.1", "localhost");
+    let server = Fixture::new(move |path| {
+        if path.contains("first=") {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !gate.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            finished.store(true, Ordering::SeqCst);
+            (503, "text/plain", "Later page unavailable".into())
+        } else {
+            (
+                200,
+                "text/html",
+                format!(
+                    "<li class='b_algo'><h2><a href='{article_url}'>First page paper</a></h2></li><a class='sb_pagN' href='/bing?q=gripper&amp;first=11'>Next</a>"
+                ),
+            )
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--search-mode",
+        "balanced",
+        "--engines",
+        "bing",
+        "--search-pages",
+        "3",
+        "--limit",
+        "10",
+        "--concurrency",
+        "2",
+        "--read",
+        "--format",
+        "jsonl",
+    ])
+    .arg("--data-dir")
+    .arg(directory.path())
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut events = Vec::new();
+    let mut read_before_later_page = false;
+    while let Ok(line) = receive.recv_timeout(Duration::from_secs(4)) {
+        let event: Value = serde_json::from_str(&line).unwrap();
+        let document = event["item"]["kind"] == "document";
+        events.push(event);
+        if document {
+            read_before_later_page = !later_finished.load(Ordering::SeqCst);
+            break;
+        }
+        if events.last().unwrap()["type"] == "complete" {
+            break;
+        }
+    }
+    release.store(true, Ordering::SeqCst);
+    if !read_before_later_page {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    events.extend(
+        receive
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap()),
+    );
+    assert!(
+        read_before_later_page,
+        "first document waited for page two: {events:?}"
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(events.iter().filter(|e| e["type"] == "record").count(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "record_update")
+            .count(),
+        0
+    );
+    let complete = events.last().unwrap();
+    assert_eq!(complete["type"], "complete");
+    assert_eq!(complete["result"]["status"], "partial");
+    assert_eq!(
+        complete["result"]["meta"]["coverage"][0]["meta"]["web_pagination"]["stop_reason"],
+        "page_failed"
+    );
+    let run_id = complete["result"]["run_id"].as_str().unwrap();
+    let saved = cli(&["inspect", run_id])
+        .arg("--data-dir")
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(saved.status.success());
+    let saved = parsed(&saved);
+    assert_eq!(saved["items"].as_array().unwrap().len(), 2);
+    for event in events.iter().filter(|e| e["type"] == "record") {
+        let record = saved["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == event["item"]["id"])
+            .unwrap();
+        assert_eq!(record["provenance"], event["item"]["provenance"]);
+        assert_eq!(record["native"], event["item"]["native"]);
+        assert_eq!(event["run_id"], run_id);
+    }
+}
+
+#[tokio::test]
+async fn bounded_page_progress_stops_requests_and_retains_unsent_records_at_deadline() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = Fixture::new(move |path| {
+        let page = observed.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            page <= 2,
+            "must not request another page while progress is backpressured: {path}"
+        );
+        (
+            200,
+            "text/html",
+            format!(
+                "<div class='snippet' data-type='web'><a href='https://example.org/{page}'><div class='search-snippet-title'>Page {page}</div></a></div><div class='pagination'><a href='/brave?q=gripper&amp;offset={page}'>Next</a></div>"
+            ),
+        )
+    });
+    let base = url::Url::parse(&server.base).unwrap();
+    let providers = ffetch::providers::Providers {
+        http: ffetch::net::Http::new(Duration::from_secs(2), 1024 * 1024, 2).unwrap(),
+        browser: None,
+        browser_only: false,
+        hn_base: base.clone(),
+        hn_search: base.clone(),
+        web_search: base,
+        brave_search: url::Url::parse(&server.url("brave")).unwrap(),
+        searxng: None,
+        concurrency: 2,
+        web_pages: 3,
+        budget: Duration::from_millis(500),
+        reddit_community: None,
+        youtube_region: "US".into(),
+    };
+    let (send, mut receive) = tokio::sync::mpsc::channel(1);
+    let run = providers
+        .search_with_progress("engine:brave", "gripper", 10, None, send)
+        .await;
+    assert_eq!(run.status, "partial");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(run.items.len(), 2);
+    assert_eq!(run.meta["web_pagination"]["stop_reason"], "deadline");
+    assert_eq!(run.meta["web_pagination"]["pages_completed"], 2);
+    let first = receive.recv().await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, run.items[0].id);
+    assert_eq!(first[0].native, run.items[0].native);
+    assert!(receive.recv().await.is_none());
+}
+
+#[test]
+fn web_pagination_follows_engine_links_deduplicates_and_obeys_both_limits() {
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = requested.clone();
+    let fixture = Fixture::new(move |path| {
+        requests.lock().unwrap().push(path.to_owned());
+        let url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+        assert!(url.query_pairs().any(|(k, v)| k == "q" && v == "gripper"));
+        let engine = url.path().trim_start_matches('/');
+        let cursor = match engine {
+            "brave" => "offset",
+            "bing" => "first",
+            "google" => "start",
+            _ => panic!("{path}"),
+        };
+        let second = url.query_pairs().any(|(k, _)| k == cursor);
+        if second {
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == cursor && v == if engine == "brave" { "1" } else { "11" })
+            );
+        }
+        let records = ["shared", if second {"second"} else {"first"}].iter().map(|label| {
+            let link = format!("https://example.org/{engine}/{label}");
+            match engine {
+                "brave" => format!("<div class='snippet' data-type='web'><a href='{link}'><span class='search-snippet-title'>{label}</span></a></div>"),
+                "bing" => format!("<li class='b_algo'><h2><a href='{link}'>{label}</a></h2></li>"),
+                _ => format!("<div class='MjjYud'><a href='{link}'><h3>{label}</h3></a></div>"),
+            }
+        }).collect::<String>();
+        let next = format!(
+            "/{engine}?q=gripper&amp;{cursor}={}",
+            if second {
+                21
+            } else if engine == "brave" {
+                1
+            } else {
+                11
+            }
+        );
+        let pagination = match engine {
+            "brave" => format!("<div class='pagination'><a href='{next}'>Next</a></div>"),
+            "bing" => format!("<a class='sb_pagN' href='{next}'>Next page</a>"),
+            _ => format!("<a id='pnnext' href='{next}'>Next</a>"),
+        };
+        (200, "text/html", records + &pagination)
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--search-mode",
+        "deep",
+        "--engines",
+        "brave,bing,google",
+        "--search-pages",
+        "3",
+        "--limit",
+        "3",
+        "--no-store",
+    ])
+    .env("FFETCH_BRAVE_SEARCH", fixture.url("brave"))
+    .env("FFETCH_BING_SEARCH", fixture.url("bing"))
+    .env("FFETCH_GOOGLE_SEARCH", fixture.url("google"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data = parsed(&output);
+    assert_eq!(data["items"].as_array().unwrap().len(), 9);
+    assert_eq!(requested.lock().unwrap().len(), 6);
+    for source in data["meta"]["coverage"].as_array().unwrap() {
+        let page = &source["meta"]["web_pagination"];
+        assert_eq!(page["pages_completed"], 2);
+        assert_eq!(page["stop_reason"], "result_limit");
+    }
+    for record in data["items"].as_array().unwrap() {
+        if record["url"].as_str().unwrap().ends_with("/second") {
+            assert_eq!(record["native"]["origins"][0]["rank"], 4);
+            assert_eq!(
+                record["native"]["origins"][0]["rank_basis"],
+                "observed-result-order"
+            );
+            assert_eq!(
+                record["native"]["provider_data"]["search_page"]["number"],
+                2
+            );
+            assert!(
+                record["provenance"]["source_url"]
+                    .as_str()
+                    .unwrap()
+                    .contains("&")
+            );
+        }
+    }
+    // A smaller page budget stops even when the result limit is not satisfied.
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--search-mode",
+        "deep",
+        "--engines",
+        "bing",
+        "--search-pages",
+        "2",
+        "--limit",
+        "10",
+        "--no-store",
+    ])
+    .env("FFETCH_BING_SEARCH", fixture.url("bing"))
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    let data = parsed(&output);
+    assert_eq!(data["items"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        data["meta"]["coverage"][0]["meta"]["web_pagination"]["stop_reason"],
+        "page_budget"
+    );
+    assert_eq!(requested.lock().unwrap().len(), 8);
+}
+
+#[test]
+fn web_pagination_retains_completed_pages_on_failure_or_deadline() {
+    let fixture = Fixture::new(|path| {
+        if path.contains("first=") {
+            if path.contains("q=slow") {
+                thread::sleep(Duration::from_millis(1500));
+            }
+            return (503, "text/html", "Unavailable".into());
+        }
+        let query = if path.contains("q=slow") {
+            "slow"
+        } else {
+            "fail"
+        };
+        (
+            200,
+            "text/html",
+            format!(
+                "<li class='b_algo'><h2><a href='https://example.org/available'>Available</a></h2></li><a class='sb_pagN' href='/bing?q={query}&amp;first=11'>Next</a>"
+            ),
+        )
+    });
+    for (query, reason) in [("fail", "page_failed"), ("slow", "deadline")] {
+        let output = cli(&[
+            "search",
+            query,
+            "--sources",
+            "web",
+            "--search-mode",
+            "deep",
+            "--engines",
+            "bing",
+            "--search-pages",
+            "3",
+            "--limit",
+            "10",
+            "--timeout",
+            "1",
+            "--no-store",
+        ])
+        .env("FFETCH_BING_SEARCH", fixture.url("bing"))
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let data = parsed(&output);
+        assert_eq!(data["items"].as_array().unwrap().len(), 1);
+        let page = &data["meta"]["coverage"][0]["meta"]["web_pagination"];
+        assert_eq!(page["pages_requested"], 2);
+        assert_eq!(page["pages_completed"], 1);
+        assert_eq!(page["stop_reason"], reason);
+    }
+}
+
+#[test]
+fn web_pagination_rejects_changed_origin_query_and_cursor() {
+    let followed = Arc::new(AtomicBool::new(false));
+    let trap_flag = followed.clone();
+    let trap = Fixture::new(move |_| {
+        trap_flag.store(true, Ordering::SeqCst);
+        (200, "text/html", String::new())
+    });
+    let foreign = trap.url("bing?q=origin&first=11");
+    let fixture = Fixture::new(move |path| {
+        assert!(
+            !path.contains("first="),
+            "must not follow invalid pagination"
+        );
+        let next = if path.contains("q=origin") {
+            foreign.clone()
+        } else if path.contains("q=query") {
+            "/bing?q=other&first=11".into()
+        } else {
+            "/bing?q=cursor&first=0".into()
+        };
+        (
+            200,
+            "text/html",
+            format!(
+                "<li class='b_algo'><h2><a href='https://example.org/available'>Available</a></h2></li><a class='sb_pagN' href='{next}'>Next</a>"
+            ),
+        )
+    });
+    for query in ["origin", "query", "cursor"] {
+        let output = cli(&[
+            "search",
+            query,
+            "--sources",
+            "web",
+            "--search-mode",
+            "deep",
+            "--engines",
+            "bing",
+            "--search-pages",
+            "3",
+            "--limit",
+            "10",
+            "--no-store",
+        ])
+        .env("FFETCH_BING_SEARCH", fixture.url("bing"))
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let data = parsed(&output);
+        assert_eq!(data["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            data["meta"]["coverage"][0]["meta"]["web_pagination"]["stop_reason"],
+            "pagination_rejected"
+        );
+        assert_eq!(data["errors"][0]["code"], "pagination_rejected");
+        assert_eq!(data["errors"][0]["retryable"], false);
+        assert!(
+            data["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pagination")
+        );
+    }
+    assert!(!followed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn web_pagination_stops_on_missing_links_repeated_results_and_unsupported_engines() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let fixture = Fixture::new(move |path| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !path.contains("first=21"),
+            "must stop after a page with no new results"
+        );
+        let html = if path.contains("q=unsupported") {
+            "<div class='result'><a class='result__a' href='https://example.org/paper'>Paper</a></div>".into()
+        } else {
+            let mut html =
+                "<li class='b_algo'><h2><a href='https://example.org/paper'>Paper</a></h2></li>"
+                    .to_owned();
+            if path.contains("q=repeated") {
+                let next = if path.contains("first=") { 21 } else { 11 };
+                html += &format!(
+                    "<a class='sb_pagN' href='/bing?q=repeated&amp;first={next}'>Next</a>"
+                );
+            }
+            html
+        };
+        (200, "text/html", html)
+    });
+    for (engine, query, reason) in [
+        ("bing", "missing", "no_recognized_next_link"),
+        ("bing", "repeated", "no_new_results"),
+        ("duckduckgo", "unsupported", "pagination_unsupported"),
+    ] {
+        let output = cli(&[
+            "search",
+            query,
+            "--sources",
+            "web",
+            "--search-mode",
+            "deep",
+            "--engines",
+            engine,
+            "--search-pages",
+            "3",
+            "--limit",
+            "10",
+            "--no-store",
+        ])
+        .env("FFETCH_BING_SEARCH", fixture.url("bing"))
+        .env("FFETCH_WEB_SEARCH", fixture.url("ddg"))
+        .output()
+        .unwrap();
+        assert!(output.status.success());
+        let data = parsed(&output);
+        assert_eq!(data["items"].as_array().unwrap().len(), 1);
+        let pagination = &data["meta"]["coverage"][0]["meta"]["web_pagination"];
+        assert_eq!(pagination["coverage"], "bounded");
+        assert_eq!(pagination["stop_reason"], reason);
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+#[cfg(unix)]
+fn failed_browser_startup_is_diagnosed_once_per_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let browser = dir.path().join("broken-browser");
+    let launches = dir.path().join("launches");
+    std::fs::write(&browser, "#!/bin/sh\nprintf 'start\\n' >> \"$FFETCH_TEST_LAUNCH_COUNT\"\nprintf 'No usable sandbox!\\nprivate diagnostic https://secret.invalid/?token=private\\n' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = Fixture::new(|path| {
+        if path.starts_with("/bing") {
+            (200, "text/html", "<li class='b_algo'><h2><a href='https://example.org/gripper'>Gripper design</a></h2></li>".into())
+        } else {
+            (200, "text/html", "<title>Captcha</title>".into())
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--engines",
+        "google,bing,duckduckgo",
+        "--search-mode",
+        "deep",
+        "--browser",
+        "auto",
+        "--browser-path",
+        browser.to_str().unwrap(),
+        "--no-store",
+    ])
+    .env("FFETCH_GOOGLE_SEARCH", server.url("google"))
+    .env("FFETCH_BING_SEARCH", server.url("bing"))
+    .env("FFETCH_WEB_SEARCH", server.url("duckduckgo"))
+    .env("FFETCH_TEST_LAUNCH_COUNT", &launches)
+    .output()
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data = parsed(&output);
+    assert_eq!(data["items"].as_array().unwrap().len(), 1);
+    assert_eq!(data["errors"].as_array().unwrap().len(), 2);
+    for error in data["errors"].as_array().unwrap() {
+        assert_eq!(error["code"], "browser_unavailable");
+        assert_eq!(error["retryable"], false);
+        assert!(error["next_action"].as_str().unwrap().contains("sandbox"));
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("Chromium sandbox initialization failed"),
+            "{message}"
+        );
+        assert!(message.contains("--browser off"));
+        assert!(!message.contains("secret.invalid"));
+        assert!(!message.contains("inspect /tmp/"));
+    }
+    assert_eq!(std::fs::read_to_string(&launches).unwrap(), "start\n");
+    // Failure observations expire with the invocation, not permanently.
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--engines",
+        "google",
+        "--search-mode",
+        "deep",
+        "--browser",
+        "auto",
+        "--browser-path",
+        browser.to_str().unwrap(),
+        "--no-store",
+    ])
+    .env("FFETCH_GOOGLE_SEARCH", server.url("google"))
+    .env("FFETCH_TEST_LAUNCH_COUNT", &launches)
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(&launches).unwrap(),
+        "start\nstart\n"
+    );
 }
 
 #[test]

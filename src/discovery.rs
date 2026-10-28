@@ -6,6 +6,54 @@ use crate::{
 use serde_json::json;
 use std::collections::HashMap;
 
+#[derive(serde::Serialize)]
+pub struct QueryPlan {
+    pub queries: Vec<String>,
+    pub jobs: Vec<SearchJob>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SearchJob {
+    pub query_index: usize,
+    pub source: String,
+}
+
+pub fn query_plan(
+    primary: &str,
+    variants: &[String],
+    sources: &[String],
+    max_searches: usize,
+) -> anyhow::Result<QueryPlan> {
+    anyhow::ensure!(!sources.is_empty(), "search needs at least one source");
+    let mut queries = Vec::new();
+    for query in std::iter::once(primary).chain(variants.iter().map(String::as_str)) {
+        let query = query.trim();
+        anyhow::ensure!(!query.is_empty(), "search queries must not be empty");
+        if !queries.iter().any(|q| q == query) {
+            queries.push(query.to_owned());
+        }
+    }
+    let count = queries
+        .len()
+        .checked_mul(sources.len())
+        .ok_or_else(|| anyhow::anyhow!("query/source plan size overflow"))?;
+    anyhow::ensure!(
+        count <= max_searches,
+        "query/source plan needs {count} searches, exceeding --max-searches {max_searches}; reduce queries/sources or increase the budget"
+    );
+    let jobs = queries
+        .iter()
+        .enumerate()
+        .flat_map(|(query_index, _)| {
+            sources.iter().map(move |source| SearchJob {
+                query_index,
+                source: source.clone(),
+            })
+        })
+        .collect();
+    Ok(QueryPlan { queries, jobs })
+}
+
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum, PartialEq, Eq)]
 pub enum SearchMode {
     #[default]
@@ -80,13 +128,40 @@ pub fn plan(
 pub struct Fusion {
     destinations: HashMap<String, usize>,
     research: HashMap<String, usize>,
+    native: HashMap<(String, String, String), NativeEntry>,
+}
+struct NativeEntry {
+    index: usize,
+    id: String,
+    observations: bool,
+}
+
+fn native_key(record: &Record) -> Option<(String, String, String)> {
+    let url = url::Url::parse(&record.url).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| {
+        (
+            record.source.clone(),
+            record.kind.clone(),
+            extract::canonical(&record.url),
+        )
+    })
 }
 impl Fusion {
     /// Return changed record indexes for streaming upserts. Origins include each
     /// engine's original record/provenance; fusion is not a credibility score.
     pub fn merge(&mut self, run: &mut Run, mut child: Run) -> Vec<usize> {
+        let changed = self.merge_records(run, child.items.drain(..));
+        run.merge(child);
+        changed
+    }
+
+    pub fn merge_records(
+        &mut self,
+        run: &mut Run,
+        records: impl IntoIterator<Item = Record>,
+    ) -> Vec<usize> {
         let mut changed = Vec::new();
-        for mut record in child.items.drain(..) {
+        for mut record in records {
             if let Some(key) = crate::research::identity(&record) {
                 if let Some(&index) = self.research.get(&key) {
                     crate::research::merge(&mut run.items[index], record);
@@ -100,6 +175,43 @@ impl Fusion {
                 continue;
             }
             if record.kind != "search_result" || record.source != "web" {
+                if let Some(key) = native_key(&record) {
+                    if let Some(entry) = self.native.get_mut(&key) {
+                        let existing = &mut run.items[entry.index];
+                        let queries = crate::model::combined_queries(existing, &record);
+                        if !existing.native.is_object() {
+                            existing.native = json!({"provider_data":existing.native});
+                        }
+                        if !entry.observations {
+                            let first = json!(existing);
+                            existing.native["search_observations"] = json!([first]);
+                            entry.observations = true;
+                        }
+                        let observations = existing.native["search_observations"]
+                            .as_array_mut()
+                            .unwrap();
+                        if !observations.iter().any(|o| {
+                            o["provenance"]["source_url"] == record.provenance.source_url
+                                && o["native"]["discovery_queries"]
+                                    == record.native["discovery_queries"]
+                        }) {
+                            observations.push(json!(record));
+                        }
+                        if !queries.is_empty() {
+                            existing.native["discovery_queries"] = json!(queries);
+                        }
+                        changed.push(entry.index);
+                        continue;
+                    }
+                    self.native.insert(
+                        key,
+                        NativeEntry {
+                            index: run.items.len(),
+                            id: record.id.clone(),
+                            observations: false,
+                        },
+                    );
+                }
                 changed.push(run.items.len());
                 run.items.push(record);
                 continue;
@@ -108,10 +220,13 @@ impl Fusion {
             let origins = record.native.get("origins").cloned().unwrap_or(json!([]));
             if let Some(&index) = self.destinations.get(&key) {
                 let existing = &mut run.items[index];
+                let queries = crate::model::combined_queries(existing, &record);
                 if let Some(new) = origins.as_array() {
                     let all = existing.native["origins"].as_array_mut().unwrap();
                     for origin in new {
-                        if !all.iter().any(|o| o["engine"] == origin["engine"]) {
+                        if !all.iter().any(|o| {
+                            o["engine"] == origin["engine"] && o["query"] == origin["query"]
+                        }) {
                             all.push(origin.clone());
                         }
                     }
@@ -120,6 +235,9 @@ impl Fusion {
                     existing.text = record.text.take();
                 }
                 score(existing);
+                if !queries.is_empty() {
+                    existing.native["discovery_queries"] = json!(queries);
+                }
                 changed.push(index);
             } else {
                 record.native["origins"] = origins;
@@ -129,7 +247,6 @@ impl Fusion {
                 run.items.push(record);
             }
         }
-        run.merge(child);
         changed
     }
     pub fn finish(&mut self, run: &mut Run) {
@@ -166,17 +283,40 @@ impl Fusion {
                     .insert(extract::canonical(&record.url), index);
             }
         }
-        run.meta["ranking"] = json!({"method":"reciprocal-rank-fusion", "constant":60,"independent_indexes_verified":false,"ordered_record_ids":run.items.iter().map(|r| &r.id).collect::<Vec<_>>()});
+        for (index, record) in run.items.iter().enumerate() {
+            if let Some(key) = native_key(record)
+                && let Some(entry) = self.native.get_mut(&key)
+                && entry.id == record.id
+            {
+                entry.index = index;
+            }
+        }
+        run.meta["ranking"] = json!({"method":"reciprocal-rank-fusion", "constant":60,"query_aggregation":"best observed rank per engine","independent_indexes_verified":false,"ordered_record_ids":run.items.iter().map(|r| &r.id).collect::<Vec<_>>()});
     }
 }
 fn score(record: &mut Record) {
     let origins = record.native["origins"].as_array().unwrap();
-    let sum: f64 = origins
-        .iter()
-        .map(|o| 1.0 / (60.0 + o["rank"].as_u64().unwrap_or(1) as f64))
+    let mut engines = std::collections::BTreeMap::new();
+    let mut queries = std::collections::BTreeSet::new();
+    for origin in origins {
+        let rank = origin["rank"].as_u64().unwrap_or(1);
+        let engine = origin["engine"].as_str().unwrap_or("unknown");
+        engines
+            .entry(engine)
+            .and_modify(|best: &mut u64| *best = (*best).min(rank))
+            .or_insert(rank);
+        if let Some(query) = origin["query"].as_str() {
+            queries.insert(query);
+        }
+    }
+    let sum: f64 = engines
+        .values()
+        .map(|rank| 1.0 / (60.0 + *rank as f64))
         .sum();
     record.metrics["fusion_score"] = json!(sum);
-    record.metrics["engine_count"] = json!(origins.len());
+    record.metrics["engine_count"] = json!(engines.len());
+    record.metrics["query_count"] = json!(queries.len());
+    record.metrics["observation_count"] = json!(origins.len());
 }
 
 #[cfg(test)]
@@ -190,6 +330,82 @@ mod tests {
             run.items.push(item);
         }
         run
+    }
+    #[test]
+    fn query_variants_preserve_observations_without_inflating_engine_agreement() {
+        let mut run = Run::new("search");
+        let mut fusion = Fusion::default();
+        for query in ["gripper", "tendon"] {
+            let mut result = branch("bing", &["https://example.org/one-engine"]);
+            result.items[0].native["origins"][0]["query"] = json!(query);
+            fusion.merge(&mut run, result);
+        }
+        for engine in ["brave", "google"] {
+            fusion.merge(
+                &mut run,
+                branch(
+                    engine,
+                    &[
+                        "https://example.org/other",
+                        "https://example.org/two-engines",
+                    ],
+                ),
+            );
+        }
+        let one = run
+            .items
+            .iter()
+            .find(|r| r.url.ends_with("one-engine"))
+            .unwrap();
+        let two = run
+            .items
+            .iter()
+            .find(|r| r.url.ends_with("two-engines"))
+            .unwrap();
+        assert_eq!(one.metrics["engine_count"], 1);
+        assert_eq!(one.metrics["query_count"], 2);
+        assert_eq!(one.native["origins"].as_array().unwrap().len(), 2);
+        assert!(
+            two.metrics["fusion_score"].as_f64().unwrap()
+                > one.metrics["fusion_score"].as_f64().unwrap()
+        );
+    }
+
+    #[test]
+    fn native_query_observations_keep_identity_after_final_ordering() {
+        let mut run = Run::new("search");
+        let mut fusion = Fusion::default();
+        let native = |query: &str, score: u64| {
+            let mut item = Record::new("story", "hn", "https://news.ycombinator.com/item?id=1");
+            item.id = "hn:1".into();
+            item.metrics = json!({"score":score});
+            item.native = json!({"discovery_queries":[query]});
+            item.provenance.source_url = format!("https://hn.algolia.com/search?query={query}");
+            item
+        };
+        fusion.merge_records(&mut run, [native("gripper", 10)]);
+        fusion.merge(&mut run, branch("bing", &["https://example.org/paper"]));
+        fusion.finish(&mut run);
+        fusion.merge_records(&mut run, [native("tendon", 20)]);
+        assert_eq!(run.items.len(), 2);
+        let item = &run.items[1];
+        assert_eq!(item.id, "hn:1");
+        assert_eq!(
+            item.native["discovery_queries"],
+            json!(["gripper", "tendon"])
+        );
+        assert_eq!(
+            item.native["search_observations"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            item.native["search_observations"][0]["metrics"]["score"],
+            10
+        );
+        assert_eq!(
+            item.native["search_observations"][1]["metrics"]["score"],
+            20
+        );
     }
     #[test]
     fn consensus_ranking_is_independent_of_engine_completion_order() {

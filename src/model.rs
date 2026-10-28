@@ -4,6 +4,21 @@ use serde_json::{Value, json};
 
 pub const SCHEMA_VERSION: &str = "ffetch/1";
 
+pub(crate) fn combined_queries(first: &Record, second: &Record) -> Vec<String> {
+    let mut queries = Vec::new();
+    for record in [first, second] {
+        if let Some(values) = record.native["discovery_queries"].as_array() {
+            for query in values.iter().filter_map(serde_json::Value::as_str) {
+                if !queries.iter().any(|q| q == query) {
+                    queries.push(query.to_owned());
+                }
+            }
+        }
+    }
+    queries.sort();
+    queries
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provenance {
     pub retrieved_at: String,

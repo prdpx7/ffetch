@@ -16,8 +16,19 @@ pub async fn search(
     limit: usize,
     run: &mut Run,
 ) -> Result<()> {
+    search_at(providers, engine, query, limit, None, run).await
+}
+
+pub(crate) async fn search_at(
+    providers: &Providers,
+    engine: &str,
+    query: &str,
+    limit: usize,
+    page_url: Option<&Url>,
+    run: &mut Run,
+) -> Result<()> {
     match engine {
-        "brave" => return providers.search_brave(query, limit, run).await,
+        "brave" => return providers.search_brave(query, limit, page_url, run).await,
         "duckduckgo" => return providers.search_ddg(query, limit, run).await,
         "searxng" => return searxng(providers, query, limit, run).await,
         _ => (),
@@ -56,6 +67,9 @@ pub async fn search(
     let variable = format!("FFETCH_{}_SEARCH", engine.to_ascii_uppercase());
     let mut url = Url::parse(&std::env::var(variable).unwrap_or_else(|_| endpoint.into()))?;
     url.query_pairs_mut().append_pair(parameter, query);
+    if let Some(page_url) = page_url {
+        url = page_url.clone();
+    }
     run.meta["search_url"] = json!(url.as_str());
     let response = providers.search_response(url).await?;
     ensure!(
@@ -151,8 +165,63 @@ pub async fn search(
         !run.items.is_empty(),
         "{engine} returned no recognized organic results; empty results, challenge, consent, or changed markup requires inspection"
     );
-    run.meta["pagination"] = json!("first engine page");
+    run.meta["pagination"] = json!("single response page");
+    if let Err(error) = record_next_page(engine, &doc, &response.url, query, run) {
+        run.meta["pagination_error"] = json!(error.to_string());
+    }
     run.meta["adapter_validation"] = json!("layout-based; live availability varies");
+    Ok(())
+}
+
+/// Follow only an engine's explicit forward link, with the same origin, path,
+/// query and an increasing page cursor. Never fabricate offsets or follow an
+/// organic result as pagination. Missing markup means unknown coverage.
+pub(crate) fn record_next_page(
+    engine: &str,
+    doc: &scraper::Html,
+    current: &Url,
+    query: &str,
+    run: &mut Run,
+) -> Result<()> {
+    let (selector, cursor) = match engine {
+        "bing" => ("a.sb_pagN[href]", "first"),
+        "brave" => (".pagination a[href]", "offset"),
+        "google" => ("a#pnnext[href]", "start"),
+        _ => return Ok(()),
+    };
+    let position = |url: &Url| -> Option<u64> {
+        url.query_pairs()
+            .find(|(k, _)| k == cursor)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    for anchor in doc.select(&extract::selector(selector)?) {
+        if engine == "brave"
+            && !anchor
+                .text()
+                .collect::<String>()
+                .trim()
+                .eq_ignore_ascii_case("next")
+        {
+            continue;
+        }
+        let next = current.join(anchor.value().attr("href").unwrap_or_default())?;
+        ensure!(
+            next.origin() == current.origin()
+                && next.path() == current.path()
+                && next.username().is_empty()
+                && next.password().is_none()
+                && next.query_pairs().filter(|(k, _)| k == "q").count() == 1
+                && next.query_pairs().any(|(k, v)| k == "q" && v == query),
+            "{engine} pagination link changed origin, path, credentials or query; refusing to follow it"
+        );
+        ensure!(
+            next.query_pairs().filter(|(k, _)| k == cursor).count() == 1
+                && position(&next).is_some_and(|p| p > position(current).unwrap_or(0)),
+            "{engine} pagination cursor did not advance"
+        );
+        run.meta["next_page_url"] = json!(next.as_str());
+        return Ok(());
+    }
     Ok(())
 }
 

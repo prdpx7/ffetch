@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -243,8 +244,8 @@ pub async fn launch(
     loop {
         if let Some(status) = process.child.try_wait()? {
             return Err(anyhow!(
-                "browser exited during startup ({status}); inspect {}",
-                directory.join("browser.log").display()
+                "browser exited during startup ({status}); {}",
+                startup_diagnostic(directory)
             ));
         }
         if let Ok(data) = std::fs::read_to_string(&port_file) {
@@ -277,9 +278,35 @@ pub async fn launch(
         }
         ensure!(
             start.elapsed() < timeout,
-            "browser startup deadline exceeded; inspect {}",
-            directory.join("browser.log").display()
+            "browser startup deadline exceeded; {}",
+            startup_diagnostic(directory)
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+// Ephemeral profiles disappear on failure. Preserve a bounded diagnosis in the
+// returned error rather than directing users to a log that no longer exists.
+fn startup_diagnostic(directory: &Path) -> String {
+    let log = (|| -> std::io::Result<String> {
+        let mut file = File::open(directory.join("browser.log"))?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(16 * 1024)))?;
+        let mut bytes = Vec::new();
+        file.take(16 * 1024).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })()
+    .unwrap_or_default();
+    if log.contains("No usable sandbox")
+        || log.contains("Running as root without --no-sandbox")
+        || log.contains("Failed to move to new namespace")
+    {
+        return "Chromium sandbox initialization failed. Enable sandbox support on this host, select a working Chrome with --browser-path, or use --browser off for HTTP-only retrieval. --browser-no-sandbox is available only as an explicit opt-in for a trusted isolated environment".into();
+    }
+    if log.contains("Missing X server") || log.contains("cannot open display") {
+        return "a display is unavailable; launch without --headed or configure a display".into();
+    }
+    // Keep generic diagnostics useful without copying URLs, credentials, or
+    // arbitrary browser stderr into persisted research output.
+    "startup cause was not recognized; run `ffetch browser start --session diagnose` with the same browser options to retain browser.log under the session directory".into()
 }

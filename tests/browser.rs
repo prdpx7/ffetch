@@ -36,8 +36,12 @@ impl Site {
                         let static_page = buffer[..n].starts_with(b"GET /static ");
                         let html = "<!doctype html><title>Browser fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=`<article style='min-height:1600px'><h1>Robot fixture ready</h1><label>Name <input id='name'></label><button onclick=\"document.querySelector('#answer').textContent='Hello '+document.querySelector('#name').value\">Run</button><p id='answer'></p></article>`},100)</script>";
                         let engine_page = buffer[..n].starts_with(b"GET /engine?");
-                        let html = if engine_page {
-                            "<!doctype html><title>Search fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=\"<div class='MjjYud'><a href='https://example.org/robot'><h3>Robot research</h3></a><div class='VwiC3b'>Validated engine evidence</div></div>\"},100)</script>"
+                        let html = if engine_page
+                            && String::from_utf8_lossy(&buffer[..n]).contains("start=10")
+                        {
+                            "<!doctype html><title>Search fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=\"<div class='MjjYud'><a href='https://example.org/robot2'><h3>Second robot research</h3></a></div>\"},100)</script>"
+                        } else if engine_page {
+                            "<!doctype html><title>Search fixture</title><div id='root'></div><script>setTimeout(()=>{document.querySelector('#root').innerHTML=\"<div class='MjjYud'><a href='https://example.org/robot'><h3>Robot research</h3></a><div class='VwiC3b'>Validated engine evidence</div></div><a id='pnnext' href='/engine?q=robotics&amp;start=10'>Next</a>\"},100)</script>"
                         } else if static_page {
                             "<article>Static robot document</article>"
                         } else {
@@ -261,6 +265,10 @@ fn engine_search_recovers_using_dom_and_preserves_route_attempts() {
             "web",
             "--engines",
             "google",
+            "--search-pages",
+            "2",
+            "--limit",
+            "10",
         ])
         .env("FFETCH_GOOGLE_SEARCH", format!("{}engine", site.url))
         .output()
@@ -282,6 +290,29 @@ fn engine_search_recovers_using_dom_and_preserves_route_attempts() {
     );
     assert_eq!(result["attempts"][0]["source"], "google:http");
     assert_eq!(result["attempts"][1]["source"], "google:browser");
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert_eq!(result["attempts"].as_array().unwrap().len(), 4);
+    assert_eq!(result["attempts"][2]["source"], "google:http");
+    assert!(
+        result["attempts"][3]["url"]
+            .as_str()
+            .unwrap()
+            .contains("start=10")
+    );
+    assert_eq!(
+        result["items"][1]["provenance"]["method"],
+        "google-browser-dom"
+    );
+    assert!(
+        result["items"][1]["provenance"]["source_url"]
+            .as_str()
+            .unwrap()
+            .contains("start=10")
+    );
+    assert_eq!(
+        result["meta"]["coverage"][0]["meta"]["web_pagination"]["pages_completed"],
+        2
+    );
     assert_eq!(
         result["meta"]["coverage"][0]["meta"]["retrieval_route"],
         "browser-dom"

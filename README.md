@@ -26,12 +26,46 @@ Brave, Bing, and DuckDuckGo concurrently. Duplicate URLs retain each engine's
 rank, snippet, and provenance. Final web ranking uses reciprocal rank fusion.
 
 ```sh
+ffetch search "robot gripper" --query "underactuated tendon gripper" --query "open source gripper CAD" --sources web,papers --engines brave,bing --max-searches 15
+```
+
+Repeat `--query` to search related queries together. Exact duplicates are removed
+after trimming outer whitespace. `--dry-run` prints the query/source plan without
+network requests or saved files. `--max-searches` limits query/source pairs and
+defaults to 32. Paging and HTTP retries are separate from that count.
+
+Results retain query provenance. Repeated discoveries use stable IDs and trigger
+updates in JSONL. A shared URL is read once with `--read`. Web ranking uses the
+best observed rank from each engine; repeated queries through one engine do not
+increase engine agreement. `query_count` and `observation_count` report query
+coverage separately. Native search records retain query observations; DOI records
+preserve their original provider records. Query-specific errors remain in
+`meta.coverage`.
+
+```sh
 ffetch search "robot gripper" --sources web --deep --engines google,bing,duckduckgo,yandex,baidu,brave
 ```
 
 `--deep` expands engine coverage. It does not plan follow-up queries. Use
-`--search-mode fast` for the first validated search response. `--limit` applies
-per engine or source, so the merged result count can exceed it.
+`--search-mode fast` for the first validated search response per query. `--limit`
+applies per query and source, so the merged result count can exceed it. Query
+variants are explicit; automatic query expansion and iterative research planning
+are not implemented.
+
+```sh
+ffetch search "robot gripper" --sources web --engines brave,bing --search-pages 3 --limit 50
+```
+
+`--search-pages` allows up to 20 pages per engine, with one page by default.
+Bing, Brave, and Google support explicit next-page links. Other web engines
+currently read one page. Retrieval stops at the result limit, page budget,
+deadline, missing next link, or repeated results. Coverage metadata records the
+stop reason. A missing next link does not prove that all results were searched.
+Completed pages survive later failures. Named HTML engines emit completed pages
+immediately in JSONL, and `--read` can fetch their documents while later result
+pages are still loading. Page and position metadata accompany results. Origin
+ranks count recognized results before cross-page deduplication. The progress
+queue is bounded; full run evidence is still collected in memory.
 
 ```sh
 ffetch search "robot gripper" --sources web --limit 3 --read --format jsonl
@@ -64,7 +98,21 @@ capture time and archive URL. This does not guarantee the newest capture across
 all archives. Use `--archive off` to disable recovery.
 
 `--timeout` sets a per-target or per-provider deadline. `--concurrency` defaults to
-8. `--max-bytes` limits each decoded response to 16 MiB by default.
+8. `--origin-concurrency` defaults to 4 requests per origin within that global
+limit. Redirects use the destination's limit. `--max-bytes` limits each decoded
+response to 16 MiB by default.
+
+HTTP GET requests retry at most once after a valid `Retry-After` on 429 or 503.
+The delay must fit the remaining operation budget. Cooldowns are shared by HTTP
+requests to the same origin during the current invocation. Other origins can
+continue while one is waiting. Redirect delays also respect `Retry-After`.
+Queue waits, redirects, and retry delays share `--timeout`; each HTTP attempt is
+capped at 15 seconds. arXiv uses its own spacing gate without an automatic retry.
+
+`meta.http` reports HTTP dispatches, retries, backoff responses, redirects, and
+remaining origin cooldowns. It records origins without paths, queries, or bearer
+tokens. These counters cover ffetch's HTTP client; browser network traffic and
+other CLI processes use separate state.
 
 ## Research sources
 
@@ -112,6 +160,10 @@ ffetch trends --sources reddit --community robotics --feed top --period week
 ```sh
 ffetch thread 'https://news.ycombinator.com/item?id=8863' --limit 100
 ```
+
+HN threads schedule comments as request slots become free. `--limit` bounds
+unique comment requests. Thread metadata reports returned, failed, queued, and
+unfinished requests, with complete or incomplete coverage.
 
 Reddit thread URLs also work. Public Reddit API access may be blocked. Search can
 return scoped web results with partial status and native metrics unavailable.
@@ -173,6 +225,14 @@ eligible HTTP or parsing failures.
 an executable with `--browser-path` or `FFETCH_BROWSER_PATH`. Browser installation
 is separate. Rendered DOM artifacts are labeled separately from HTTP responses.
 
+If Chromium cannot start, ffetch reports `browser_unavailable` with a startup
+diagnosis. Automatic rendering shares startup failures across providers in the
+current run, avoiding repeated launches after a failed startup.
+Other successful providers remain available with partial status. On hosts where
+Chromium reports an unusable sandbox, configure sandbox support or select a
+working Chrome installation. `--browser off` keeps retrieval on HTTP routes.
+`--browser-no-sandbox` is an explicit option for trusted isolated environments.
+
 ## Output and storage
 
 JSON output uses schema `ffetch/1` with items, errors, attempts, warnings, and
@@ -195,8 +255,9 @@ profiles and session state. Screenshots write to the requested path.
 ## Current limits
 
 Search engines can block requests or change their HTML. CAPTCHA recovery and
-universal access are not guaranteed. HTML search adapters currently read the
-initial results page. Browser support has been tested on controlled local pages.
+universal access are not guaranteed. Web pagination depends on recognized engine
+markup and can be blocked independently of the initial page. Browser support has
+been tested on controlled local pages.
 Live caption retrieval and authenticated platform access need broader validation.
 
 X search, PDF/OCR extraction, measured trends, and prompt-injection detection are

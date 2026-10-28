@@ -42,9 +42,12 @@ impl Fetcher {
                 .errors
                 .push(Issue::new("web", "invalid_url", e.to_string())),
             Ok(url) => {
-                if tokio::time::timeout(self.budget, self.resolve(&url, options, archive, &mut run))
-                    .await
-                    .is_err()
+                if crate::net::within_budget(
+                    self.budget,
+                    self.resolve(&url, options, archive, &mut run),
+                )
+                .await
+                .is_err()
                 {
                     let mut issue = Issue::new(
                         "web",
@@ -86,11 +89,15 @@ impl Fetcher {
                 },
                 Err(e) => {
                     let reason = e.to_string();
-                    render_needed = reason.contains("challenge")
-                        || reason.contains("javascript_required")
-                        || reason.contains("403")
-                        || reason.contains("401")
-                        || reason.contains("request failed");
+                    render_needed = !reason.contains("Retry-After")
+                        && !reason.contains("HTTP 429")
+                        && !reason.contains("HTTP 503")
+                        && (reason.contains("challenge")
+                            || reason.contains("javascript_required")
+                            || reason.contains("403")
+                            || reason.contains("401")
+                            || reason.contains("request failed")
+                            || reason.contains("request deadline"));
                     record_attempt(run, "http", url, &reason, start);
                 }
             }
@@ -103,7 +110,7 @@ impl Fetcher {
             if renderer.available() {
                 // Leave part of the overall budget for archive lookup and cleanup.
                 let allowance = self.budget.mul_f64(0.7);
-                match tokio::time::timeout(allowance, renderer.render(url)).await {
+                match crate::net::within_budget(allowance, renderer.render(url)).await {
                     Ok(Ok(rendered)) => {
                         let observed = rendered.status_observed;
                         run.warnings.extend(rendered.warnings);
