@@ -1019,7 +1019,7 @@ impl Providers {
         let profile = if self.browser_only {
             "chromium-dom"
         } else {
-            "chrome152-user-agent-only"
+            "chrome152-user-agent-http1"
         };
         run.meta["request_profile"] = json!(profile);
         let response = if self.browser_only {

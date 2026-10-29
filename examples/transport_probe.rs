@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         } else {
             http.get_once(url).await
         };
-        let mut result = json!({"case":case.name,"url":case.url,"elapsed_ms":began.elapsed().as_millis(),"transport":"ffetch-reqwest","request_profile":if browser_user_agent {"chrome152-user-agent-only"}else{"ffetch"}});
+        let mut result = json!({"case":case.name,"url":case.url,"elapsed_ms":began.elapsed().as_millis(),"transport":"ffetch-reqwest","request_profile":if browser_user_agent {"chrome152-user-agent-http1"}else{"ffetch"}});
         match response {
             Ok(response) => {
                 let file = format!("response-{index}.html");

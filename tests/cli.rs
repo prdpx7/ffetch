@@ -192,7 +192,7 @@ fn duckduckgo_header_profile_recovers_organic_results_without_changing_document_
     );
     assert_eq!(
         run["meta"]["coverage"][0]["meta"]["request_profile"],
-        "chrome152-user-agent-only"
+        "chrome152-user-agent-http1"
     );
     assert_eq!(run["meta"]["http"]["requests_started"], 2);
     assert_eq!(run["meta"]["http"]["responses_by_protocol"]["http1"], 2);

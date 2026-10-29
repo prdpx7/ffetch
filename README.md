@@ -25,8 +25,8 @@ The default sources are web search and Hacker News. Balanced web search gathers
 Brave, Bing, and DuckDuckGo concurrently. Duplicate URLs retain each engine's
 rank, snippet, and provenance. Final web ranking uses reciprocal rank fusion.
 
-DuckDuckGo HTTP search uses a browser-compatible User-Agent header. TLS and HTTP
-remain on the ordinary Rust transport; this does not execute JavaScript or
+DuckDuckGo HTTP search uses a browser-compatible User-Agent header over HTTP/1.1.
+TLS remains on the Rust transport; this does not execute JavaScript or
 provide full browser impersonation. Other HTTP requests retain ffetch's default
 User-Agent. The selected search profile is included in coverage metadata.
 
@@ -126,6 +126,8 @@ HTTPS negotiates HTTP/2 when the server supports it, with HTTP/1.1 fallback.
 Concurrent requests to one origin can share a TLS connection. The same request,
 deadline, retry, and decoded body limits apply to both protocols. HTTP/2 reduces
 connection setup in this case; it does not guarantee lower latency on every site.
+DuckDuckGo uses a separate lazy HTTP/1.1 pool because live checks returned
+challenge pages with HTTP/2. Both pools share request limits and origin cooldowns.
 
 ## Research sources
 

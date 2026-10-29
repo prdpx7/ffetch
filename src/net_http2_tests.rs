@@ -132,18 +132,21 @@ impl Site {
     fn client(&self, h1: bool, max_bytes: usize, limit: usize, trust: bool) -> Http {
         let timeout = Duration::from_secs(5);
         let mut http = Http::with_limits(timeout, max_bytes, limit, limit).unwrap();
-        let mut client = Client::builder()
-            .no_proxy()
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none());
-        if trust {
-            client = client.add_root_certificate(reqwest::Certificate::from_pem(CA).unwrap());
+        let builder = || {
+            let mut client = Http::client_builder(timeout).no_proxy();
+            if trust {
+                client = client.add_root_certificate(reqwest::Certificate::from_pem(CA).unwrap());
+            }
+            client
+        };
+        http.client = if h1 {
+            builder().http1_only()
+        } else {
+            builder()
         }
-        if h1 {
-            client = client.http1_only();
-        }
-        http.client = client.build().unwrap();
+        .build()
+        .unwrap();
+        *http.browser_http1.lock().unwrap() = Some(builder().http1_only().build().unwrap());
         http
     }
 
@@ -248,6 +251,24 @@ async fn serve_h1(tls: TlsStream<TcpStream>, state: Arc<State>) {
         }
         let _active = Active::new(&state);
         delay(&path, &state).await;
+        if path.starts_with("/cross?") {
+            let url = Url::parse(&format!("https://fixture{path}")).unwrap();
+            let target = url
+                .query_pairs()
+                .find(|(key, _)| key == "target")
+                .unwrap()
+                .1
+                .into_owned();
+            let head =
+                format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n");
+            if io.get_mut().write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if io.get_mut().flush().await.is_err() {
+                return;
+            }
+            continue;
+        }
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
             PAYLOAD.len()
@@ -419,7 +440,52 @@ async fn retry_after_and_cooldown_keep_http2_dispatch_bounded() {
     assert!(error.to_string().contains("Retry-After"));
     assert_eq!(http.stats().requests_started, 3);
     assert_eq!(http.stats().backoff_responses, 2);
+    assert!(
+        http.get_with_browser_user_agent(site.url("/fast"), false)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Retry-After")
+    );
+    assert_eq!(http.stats().requests_started, 3);
     site.assert_connections(1);
+}
+
+#[tokio::test]
+async fn browser_profile_keeps_http1_reusable_and_resets_protocol_on_cross_origin_redirect() {
+    let site = Site::new(true).await;
+    let destination = Site::new(true).await;
+    let http = site.client(false, 4096, 4, true);
+    for _ in 0..2 {
+        assert_eq!(
+            http.get_with_browser_user_agent(site.url("/fast"), false)
+                .await
+                .unwrap()
+                .bytes,
+            PAYLOAD
+        );
+    }
+    site.assert_connections(1);
+    assert_eq!(http.stats().responses_by_protocol.http1, 2);
+    assert_eq!(http.get(site.url("/fast")).await.unwrap().bytes, PAYLOAD);
+    site.assert_connections(2);
+    let mut redirect = site.url("/cross");
+    redirect
+        .query_pairs_mut()
+        .append_pair("target", destination.url("/fast").as_str());
+    assert_eq!(
+        http.get_with_browser_user_agent(redirect, false)
+            .await
+            .unwrap()
+            .bytes,
+        PAYLOAD
+    );
+    site.assert_connections(2);
+    destination.assert_connections(1);
+    assert_eq!(http.stats().responses_by_protocol.http1, 3);
+    assert_eq!(http.stats().responses_by_protocol.http2, 2);
+    assert_eq!(http.stats().redirects_followed, 1);
 }
 
 #[cfg(unix)]

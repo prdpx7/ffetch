@@ -28,7 +28,7 @@ const SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 enum HeaderProfile {
     Standard,
     GitHub { search: bool },
-    BrowserUserAgent,
+    BrowserHttp1,
 }
 
 /// Nested provider stages can narrow the operation deadline. The scoped future
@@ -47,6 +47,7 @@ pub async fn within_budget<F: std::future::Future>(
 #[derive(Clone)]
 pub struct Http {
     client: Client,
+    browser_http1: Arc<Mutex<Option<Client>>>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
     origins: Arc<Mutex<HashMap<String, Arc<Origin>>>>,
     timeout: Duration,
@@ -203,7 +204,21 @@ impl Http {
             Instant::now().checked_add(timeout).is_some(),
             "HTTP timeout exceeds monotonic clock range"
         );
-        let client = Client::builder()
+        let client = Self::client_builder(timeout).build()?;
+        Ok(Self {
+            client,
+            browser_http1: Arc::new(Mutex::new(None)),
+            max_bytes,
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            origins: Arc::new(Mutex::new(HashMap::new())),
+            timeout,
+            concurrency,
+            origin_concurrency: origin_concurrency.min(concurrency),
+        })
+    }
+
+    fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+        Client::builder()
             .user_agent(concat!(
                 "ffetch/",
                 env!("CARGO_PKG_VERSION"),
@@ -212,16 +227,19 @@ impl Http {
             .timeout(timeout.min(Duration::from_secs(15)))
             .connect_timeout(Duration::from_secs(10).min(timeout))
             .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self {
-            client,
-            max_bytes,
-            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency)),
-            origins: Arc::new(Mutex::new(HashMap::new())),
-            timeout,
-            concurrency,
-            origin_concurrency: origin_concurrency.min(concurrency),
-        })
+    }
+
+    fn profile_client(&self, profile: HeaderProfile) -> Result<Client> {
+        if !matches!(profile, HeaderProfile::BrowserHttp1) {
+            return Ok(self.client.clone());
+        }
+        // Preserve the measured DDG HTTP/1 profile. Build its pool only when
+        // needed; clones share it and the ordinary origin/global scheduler.
+        let mut client = self.browser_http1.lock().unwrap();
+        if client.is_none() {
+            *client = Some(Self::client_builder(self.timeout).http1_only().build()?);
+        }
+        Ok(client.as_ref().unwrap().clone())
     }
 
     fn origin(&self, url: &Url) -> Arc<Origin> {
@@ -350,14 +368,14 @@ impl Http {
         self.get_profile(url, token, true, HeaderProfile::GitHub { search })
             .await
     }
-    /// A browser User-Agent on this origin, retaining the same TLS, connection
-    /// pool, bounds and cooldowns. This never starts a browser process.
+    /// A browser User-Agent over HTTP/1 on this origin. The reusable profile
+    /// pool shares bounds and cooldowns with ordinary HTTP. No browser starts.
     pub async fn get_with_browser_user_agent(
         &self,
         url: Url,
         allow_retry: bool,
     ) -> Result<Response> {
-        self.get_profile(url, None, allow_retry, HeaderProfile::BrowserUserAgent)
+        self.get_profile(url, None, allow_retry, HeaderProfile::BrowserHttp1)
             .await
     }
     async fn get_authorized(
@@ -425,10 +443,10 @@ impl Http {
             );
             let origin = self.origin(&url);
             let (_local, _global) = self.acquire(&origin, deadline).await?;
-            let mut request = self.client.get(url.clone());
+            let mut request = self.profile_client(profile)?.get(url.clone());
             match profile {
                 HeaderProfile::Standard => (),
-                HeaderProfile::BrowserUserAgent => {
+                HeaderProfile::BrowserHttp1 => {
                     request = request.header("User-Agent", SEARCH_USER_AGENT)
                 }
                 HeaderProfile::GitHub { search } => {
