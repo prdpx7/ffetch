@@ -39,6 +39,16 @@ impl Site {
                         let attribute_page = buffer[..n].starts_with(b"GET /attribute ");
                         let redirect_page = buffer[..n].starts_with(b"GET /redirect ");
                         let missing_page = buffer[..n].starts_with(b"GET /missing ");
+                        let request = String::from_utf8_lossy(&buffer[..n]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("");
+                        let challenged_header =
+                            matches!(path, "/challenge-redirect" | "/challenge-opaque");
                         let html = if engine_page
                             && String::from_utf8_lossy(&buffer[..n]).contains("start=10")
                         {
@@ -53,13 +63,42 @@ impl Site {
                             "<!doctype html><script>setTimeout(()=>location.replace('/missing'),30)</script>"
                         } else if missing_page {
                             "<!doctype html><article>Missing robot document</article>"
+                        } else if path == "/challenge" {
+                            "<!doctype html><title>Just a moment...</title><div id='cf-challenge-running'>Checking your browser</div><script>setTimeout(()=>{document.title='Research';document.body.innerHTML='<article>Recovered research evidence</article>';document.cookie='cleared=yes; path=/'},100)</script>"
+                        } else if path == "/challenge-selector" {
+                            "<!doctype html><title>Research</title><div id='cf-please-wait'>Checking</div><script>setTimeout(()=>{document.body.innerHTML='<article>Selector challenge cleared</article>'},100)</script>"
+                        } else if path == "/challenge-redirect" {
+                            "<!doctype html><title>Just a moment...</title><p>Checking</p><script>setTimeout(()=>location.replace('/static'),100)</script>"
+                        } else if path == "/challenge-opaque" {
+                            "<!doctype html><title>Unrecognized challenge</title><article>This is a challenge response, not research</article>"
+                        } else if path == "/session-evidence"
+                            && request.to_lowercase().contains("cookie: cleared=yes")
+                        {
+                            "<!doctype html><article>Session clearance retained</article>"
+                        } else if path == "/challenge-never" || path == "/session-evidence" {
+                            "<!doctype html><title>Just a moment...</title><div id='cf-challenge-running'>Checking forever</div>"
+                        } else if path == "/denied" {
+                            "<!doctype html><title>Access denied</title><p>This request was denied</p>"
+                        } else if path == "/widget" {
+                            "<!doctype html><title>Research</title><article>Research with an embedded Turnstile widget</article><div class='cf-turnstile'></div><input name='cf-turnstile-response'>"
                         } else {
                             html
                         };
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 {} Fixture\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            if missing_page { 404 } else { 200 },
+                            "HTTP/1.1 {} Fixture\r\n{}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            if missing_page {
+                                404
+                            } else if path == "/challenge-redirect" {
+                                503
+                            } else {
+                                200
+                            },
+                            if challenged_header {
+                                "cf-mitigated: challenge\r\n"
+                            } else {
+                                ""
+                            },
                             html.len(),
                             html
                         );
@@ -364,6 +403,152 @@ fn readiness_observes_attributes_redirects_and_missing_selectors() {
             .as_str()
             .unwrap()
             .contains("Static robot document")
+    );
+}
+
+#[test]
+fn challenge_readiness_recovers_content_keeps_named_sessions_and_rejects_false_success() {
+    let Ok(executable) = std::env::var("FFETCH_TEST_BROWSER") else {
+        return;
+    };
+    let browser = Browser {
+        directory: tempfile::tempdir().unwrap(),
+        executable,
+    };
+    let site = Site::new();
+    let recovered = browser.run(&[
+        "fetch",
+        &format!("{}challenge", site.url),
+        "--archive",
+        "off",
+    ]);
+    assert!(
+        recovered["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Recovered research evidence")
+    );
+    assert_eq!(recovered["items"][0]["provenance"]["method"], "browser-dom");
+    assert!(
+        recovered["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("challenge interstitial"))
+    );
+    // Reusing a named session retains the browser's own cookies, without
+    // exporting them into the Rust HTTP pool or command output.
+    let session = browser.run(&[
+        "fetch",
+        &format!("{}session-evidence", site.url),
+        "--archive",
+        "off",
+    ]);
+    assert!(
+        session["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Session clearance retained")
+    );
+    let selector = browser.run(&[
+        "browser",
+        "open",
+        &format!("{}challenge-selector", site.url),
+    ]);
+    assert!(
+        selector["items"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Selector challenge cleared")
+    );
+    // A 503 challenge is eligible for browser recovery, while an ordinary
+    // service failure or Retry-After remains a scheduling/backoff signal.
+    let redirected = browser
+        .command(&[
+            "fetch",
+            &format!("{}challenge-redirect", site.url),
+            "--archive",
+            "off",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        redirected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&redirected.stdout)
+    );
+    let redirected: Value = serde_json::from_slice(&redirected.stdout).unwrap();
+    assert_eq!(
+        redirected["meta"]["targets"][0]["http_status"], 200,
+        "{redirected}"
+    );
+    assert!(
+        redirected["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Static robot document")
+    );
+    assert!(
+        redirected["attempts"][0]["outcome"]
+            .as_str()
+            .unwrap()
+            .contains("challenge_detected")
+    );
+    for path in ["challenge-never", "denied", "challenge-opaque"] {
+        let failed = browser
+            .command(&[
+                "fetch",
+                &format!("{}{path}", site.url),
+                "--archive",
+                "off",
+                "--timeout",
+                "2",
+            ])
+            .args(["--session", "test"])
+            .output()
+            .unwrap();
+        assert!(
+            !failed.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&failed.stdout)
+        );
+        let failed: Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert!(failed["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            failed["errors"][0]["code"], "challenge_unresolved",
+            "{path}: {failed}"
+        );
+        assert!(
+            failed["errors"][0]["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("--session")
+        );
+    }
+    let widget = browser.run(&["fetch", &format!("{}widget", site.url), "--archive", "off"]);
+    assert!(
+        widget["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("embedded Turnstile widget")
+    );
+    // Automatic rendering must not inherit the named session's clearance.
+    let isolated = browser
+        .command(&[
+            "fetch",
+            &format!("{}session-evidence", site.url),
+            "--archive",
+            "off",
+            "--timeout",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(!isolated.status.success());
+    let isolated: Value = serde_json::from_slice(&isolated.stdout).unwrap();
+    assert_eq!(
+        isolated["errors"][0]["code"], "challenge_unresolved",
+        "{isolated}"
     );
 }
 

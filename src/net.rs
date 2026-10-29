@@ -22,6 +22,16 @@ mod http2_tests;
 
 tokio::task_local! { static DEADLINE: Instant; }
 
+pub(crate) fn remaining_budget(fallback: Duration) -> Duration {
+    DEADLINE
+        .try_with(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(fallback)
+        })
+        .unwrap_or(fallback)
+}
+
 // Header negotiation only. This does not emulate browser TLS or execute JS.
 const SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 #[derive(Clone, Copy)]
@@ -484,6 +494,10 @@ impl Http {
             }
             .fetch_add(1, Ordering::Relaxed);
             *last_status = Some(status);
+            let challenged = response
+                .headers()
+                .get("cf-mitigated")
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"challenge"));
             let delay = response
                 .headers()
                 .get("retry-after")
@@ -497,6 +511,7 @@ impl Http {
                 if let Some(delay) = delay {
                     origin.defer(delay);
                     if allow_retry
+                        && !challenged
                         && !retried
                         && delay < deadline.saturating_duration_since(Instant::now())
                     {
@@ -506,6 +521,21 @@ impl Http {
                     }
                 }
             }
+            ensure!(
+                !challenged,
+                "HTTP {} challenge_detected: cf-mitigated=challenge{}",
+                status.as_u16(),
+                if delay.is_some()
+                    && matches!(
+                        status,
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                    )
+                {
+                    "; Retry-After cooldown applies"
+                } else {
+                    ""
+                }
+            );
             if matches!(
                 status,
                 StatusCode::MOVED_PERMANENTLY

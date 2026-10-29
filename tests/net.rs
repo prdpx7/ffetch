@@ -85,6 +85,102 @@ impl Drop for Site {
 }
 
 #[tokio::test]
+async fn cloudflare_challenge_header_is_not_content_or_a_blind_retry() {
+    for (status, delay) in [
+        (200, None),
+        (403, None),
+        (503, None),
+        (503, Some("0")),
+        (429, Some("3600")),
+    ] {
+        let site = Site::new(move |_| {
+            let mut headers = vec![("cf-mitigated", "challenge")];
+            if let Some(delay) = delay {
+                headers.push(("Retry-After", delay));
+            }
+            reply(
+                status,
+                &headers,
+                "<article>Unrecognized challenge markup</article>",
+            )
+        });
+        let http = Http::new(Duration::from_secs(1), 4096, 4).unwrap();
+        let error = http.get(site.base.clone()).await.err().unwrap().to_string();
+        assert!(
+            error.contains(&format!("HTTP {status} challenge_detected")),
+            "{error}"
+        );
+        assert_eq!(http.stats().requests_started, 1);
+        assert_eq!(http.stats().retries_started, 0);
+        if status == 429 {
+            assert!(http.stats().origins[0].cooldown_remaining_ms > 0);
+            assert!(error.contains("Retry-After"));
+        }
+    }
+}
+
+#[test]
+fn challenged_engine_reports_an_action_without_losing_other_engines_results() {
+    let site = Site::new(|path| {
+        if path.starts_with("/google") {
+            // Even plausible organic markup must not override the header.
+            reply(
+                200,
+                &[("cf-mitigated", "challenge")],
+                "<div class='MjjYud'><a href='https://example.org/fake'><h3>False research</h3></a></div>",
+            )
+        } else {
+            reply(
+                200,
+                &[],
+                "<li class='b_algo'><h2><a href='https://example.org/robot'>Real research</a></h2></li>",
+            )
+        }
+    });
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ffetch"))
+        .args([
+            "search",
+            "robot",
+            "--sources",
+            "web",
+            "--engines",
+            "google,bing",
+            "--browser",
+            "off",
+            "--no-store",
+        ])
+        .env(
+            "FFETCH_GOOGLE_SEARCH",
+            site.base.join("google").unwrap().as_str(),
+        )
+        .env(
+            "FFETCH_BING_SEARCH",
+            site.base.join("bing").unwrap().as_str(),
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(run["items"].as_array().unwrap().len(), 1);
+    assert_eq!(run["items"][0]["title"], "Real research");
+    assert_eq!(run["errors"][0]["code"], "challenge_unresolved");
+    assert_eq!(run["errors"][0]["source"], "engine:google");
+    assert!(
+        run["errors"][0]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("--session")
+    );
+}
+
+#[tokio::test]
 async fn retry_after_waits_then_recovers_with_one_retry() {
     let times = Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = times.clone();

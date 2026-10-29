@@ -97,7 +97,7 @@ impl Fetcher {
                     let reason = e.to_string();
                     render_needed = !reason.contains("Retry-After")
                         && !reason.contains("HTTP 429")
-                        && !reason.contains("HTTP 503")
+                        && (!reason.contains("HTTP 503") || reason.contains("challenge_detected"))
                         && (reason.contains("challenge")
                             || reason.contains("javascript_required")
                             || reason.contains("403")
@@ -178,13 +178,15 @@ impl Fetcher {
         } else if archive != Archive::Off {
             run.warnings.push("Archive lookup skipped for a local/private URL or a URL containing credential-like query parameters".into());
         }
-        let mut issue = Issue::new(
+        let mut issue = run.attempts.iter().rev().find_map(|attempt| crate::browser::challenge_issue("web", &attempt.outcome)).unwrap_or_else(|| Issue::new(
             "web",
             "retrieval_failed",
             "No validated document was retrieved; inspect attempts for the original failure",
-        );
+        ));
         issue.url = Some(url.to_string());
-        issue.next_action = Some("Inspect attempts; retry with an authorized browser session, another source, or a larger timeout".into());
+        if issue.next_action.is_none() {
+            issue.next_action = Some("Inspect attempts; retry with an authorized browser session, another source, or a larger timeout".into());
+        }
         run.errors.push(issue);
     }
 

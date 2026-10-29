@@ -365,10 +365,21 @@ readiness. Use a selector when a page loads the content you need after its initi
 text. Later application updates can still occur after the selected condition.
 Client-side redirects retain the final document's observed HTTP status.
 
+Recognized challenge interstitials wait for their markers to disappear before
+the document is extracted. The wait uses DOM events and the remaining operation
+deadline. Cloudflare's `cf-mitigated: challenge` header is also detected. An
+unresolved challenge returns `challenge_unresolved` with a next action, rather
+than treating the challenge page as research content. An ordinary embedded
+Turnstile widget does not by itself block extraction.
+
 Automatic renders use separate temporary contexts for cookies and storage.
 Completed, cancelled, or timed-out renders close those contexts and their tabs.
 Use a named `--session` to keep authentication and page state between commands.
 Named sessions stay open until `browser stop`.
+Named sessions also retain browser clearance cookies. Reuse `--session` after
+completing a challenge in that browser. Cookies remain in the browser profile;
+they are not exported to the Rust HTTP client or printed in command output.
+Clearance can expire or be rejected. Live Cloudflare recovery is not verified.
 
 If Chromium cannot start, ffetch reports `browser_unavailable` with a startup
 diagnosis. Automatic rendering shares startup failures across providers in the

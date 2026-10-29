@@ -47,6 +47,25 @@ fn clean(html: &str) -> Html {
     document
 }
 
+// Keep HTTP validation and the browser's readiness gate on the same rules.
+// A Turnstile widget alone is not an interstitial: ordinary articles and forms
+// may embed one. Avoid generic spinners and mere mentions of Cloudflare.
+const CHALLENGE_TITLES: &[&str] = &[
+    "just a moment...",
+    "ddos-guard",
+    "verify you are human",
+    "security checkpoint",
+    "captcha",
+];
+const DENIED_TITLES: &[&str] = &["attention required! | cloudflare", "access denied"];
+const CHALLENGE_SELECTOR: &str = "form#challenge-form, #cf-challenge-running, form#captcha-form, #cf-please-wait, #trk_jschal_js";
+const DENIED_SELECTOR: &str =
+    "#cf-error-details .cf-error-overview h1, .cf-error-title .cf-code-label span";
+
+pub(crate) fn challenge_rules() -> Value {
+    json!({"titles":CHALLENGE_TITLES,"denied_titles":DENIED_TITLES,"selector":CHALLENGE_SELECTOR,"denied_selector":DENIED_SELECTOR})
+}
+
 /// Deliberately conservative: an article mentioning Cloudflare is not a challenge.
 pub fn invalid_content(html: &str) -> Option<&'static str> {
     let doc = Html::parse_document(html);
@@ -55,21 +74,12 @@ pub fn invalid_content(html: &str) -> Option<&'static str> {
         .next()
         .map(|e| e.text().collect::<String>().trim().to_lowercase())
         .unwrap_or_default();
-    if [
-        "just a moment...",
-        "attention required! | cloudflare",
-        "access denied",
-        "verify you are human",
-        "security checkpoint",
-        "captcha",
-    ]
-    .iter()
-    .any(|t| title == *t)
+    if CHALLENGE_TITLES
+        .iter()
+        .chain(DENIED_TITLES)
+        .any(|t| title == *t)
         || doc
-            .select(
-                &Selector::parse("form#challenge-form, #cf-challenge-running, form#captcha-form")
-                    .unwrap(),
-            )
+            .select(&Selector::parse(&format!("{CHALLENGE_SELECTOR}, {DENIED_SELECTOR}")).unwrap())
             .next()
             .is_some()
     {
@@ -298,5 +308,25 @@ mod tests {
             None
         );
         assert_eq!(invalid_content("<p>OK</p>"), None);
+        assert_eq!(
+            invalid_content("<title>DDoS-Guard</title><p>Checking</p>"),
+            Some("challenge")
+        );
+        assert_eq!(
+            invalid_content("<title>Research</title><div id='cf-please-wait'>Checking</div>"),
+            Some("challenge")
+        );
+        assert_eq!(
+            invalid_content(
+                "<title>Research</title><article>Cloudflare Turnstile integration</article><div class='cf-turnstile'></div><input name='cf-turnstile-response'>"
+            ),
+            None
+        );
+        assert_eq!(
+            invalid_content(
+                "<article>Research <div class='lds-ring'></div><p class='ray_id'>Diagnostic example</p></article>"
+            ),
+            None
+        );
     }
 }

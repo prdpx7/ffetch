@@ -37,6 +37,9 @@ fn issue(source: &str, e: impl std::fmt::Display) -> Issue {
     if let Some(issue) = crate::browser::startup_issue(source, &message) {
         return issue;
     }
+    if let Some(issue) = crate::browser::challenge_issue(source, &message) {
+        return issue;
+    }
     let code = if message.contains("HTTP 429") {
         "rate_limited"
     } else if message.contains("HTTP 503") {
@@ -730,7 +733,7 @@ impl Providers {
         }
         let message = result.as_ref().unwrap_err().to_string();
         if message.contains("429")
-            || message.contains("503")
+            || (message.contains("503") && !message.contains("challenge_detected"))
             || message.contains("Retry-After")
             || message.contains("404")
             || message.contains("410")

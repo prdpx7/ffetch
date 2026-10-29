@@ -33,6 +33,18 @@ pub(crate) fn startup_issue(source: &str, message: &str) -> Option<Issue> {
     Some(issue)
 }
 
+pub(crate) fn challenge_issue(source: &str, message: &str) -> Option<Issue> {
+    if !message.contains("browser_challenge_unresolved")
+        && !message.contains("browser_challenge_denied")
+        && !(message.contains("challenge_detected") && !message.contains("Retry-After"))
+    {
+        return None;
+    }
+    let mut issue = Issue::new(source, "challenge_unresolved", message);
+    issue.next_action = Some("Inspect the page in an authorized named browser session, then reuse --session; or select another source. Challenge completion is not guaranteed".into());
+    Some(issue)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, ValueEnum)]
 pub enum Mode {
     #[default]
@@ -116,6 +128,8 @@ mod tests {
             status: None,
             pending_status: None,
             generation: 0,
+            challenged: false,
+            current_challenged: false,
         };
         navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"stale"}}}));
         assert!(!navigation.committed);
@@ -132,6 +146,16 @@ mod tests {
         assert_eq!(navigation.generation, 2);
         navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"unknown-status"}}}));
         assert_eq!(navigation.status, None);
+        navigation.observe(&json!({"method":"Network.responseReceived","params":{"type":"Document","frameId":"subframe","loaderId":"subframe","response":{"status":403,"headers":{"cf-mitigated":"challenge"}}}}));
+        assert!(!navigation.challenged);
+        navigation.observe(&json!({"method":"Network.responseReceived","params":{"type":"Document","frameId":"main","loaderId":"unknown-status","response":{"status":503,"headers":{"Cf-Mitigated":"challenge"}}}}));
+        assert!(navigation.challenged);
+        assert!(navigation.current_challenged);
+        navigation.observe(&json!({"method":"Network.responseReceived","params":{"type":"Document","frameId":"main","loaderId":"cleared","response":{"status":200}}}));
+        navigation.observe(&json!({"method":"Page.frameNavigated","params":{"frame":{"id":"main","loaderId":"cleared"}}}));
+        assert_eq!(navigation.status, Some(200));
+        assert!(!navigation.current_challenged);
+        assert!(navigation.challenged);
     }
 
     #[tokio::test]
@@ -261,12 +285,11 @@ impl Config {
         let start = Instant::now();
         let mut run = Run::new("browser");
         run.meta = json!({"session":name});
-        match tokio::time::timeout(self.timeout, self.perform(name, action, store, &mut run)).await
-        {
+        match net::within_budget(self.timeout, self.perform(name, action, store, &mut run)).await {
             Ok(Ok(())) => (),
             Ok(Err(e)) => {
                 let message = format!("{e:#}");
-                let issue = startup_issue("browser", &message).unwrap_or_else(|| {
+                let issue = startup_issue("browser", &message).or_else(|| challenge_issue("browser", &message)).unwrap_or_else(|| {
                     let mut issue = Issue::new("browser", "browser_operation_failed", message);
                     issue.next_action=Some("Inspect the session status; refresh element references with browser inspect after navigation or DOM changes".into());
                     issue
@@ -696,15 +719,15 @@ async fn navigate_document(
         status: None,
         pending_status: None,
         generation: 0,
+        challenged: false,
+        current_challenged: false,
     };
     // Wait in an isolated world for the requested DOM condition. Mutation and
     // document events resolve immediately; no readiness polling floor is added.
-    let ready = include_str!("scripts/ready.js")
-        .replace(
-            "TIMEOUT_MS",
-            &cdp.timeout().as_millis().min(i32::MAX as u128).to_string(),
-        )
-        .replace("WAIT_FOR", &serde_json::to_string(&wait_for)?);
+    let ready_template = include_str!("scripts/ready.js").replace(
+        "CHALLENGE_RULES",
+        &serde_json::to_string(&extract::challenge_rules())?,
+    );
     loop {
         for event in cdp.drain_events()? {
             navigation.observe(&event);
@@ -714,16 +737,28 @@ async fn navigate_document(
             continue;
         }
         let generation = navigation.generation;
+        // Leave a small interval to report a structured readiness failure and
+        // clean up the context before the enclosing operation deadline.
+        let remaining =
+            net::remaining_budget(cdp.timeout()).saturating_sub(Duration::from_millis(25));
+        let ready = ready_template
+            .replace(
+                "TIMEOUT_MS",
+                &remaining.as_millis().min(i32::MAX as u128).to_string(),
+            )
+            .replacen("WAIT_FOR", &serde_json::to_string(&wait_for)?, 1);
         let extracted = async {
             let context = cdp.isolated_world().await?;
-            cdp.evaluate(&ready, Some(context)).await?;
-            document(cdp, max_bytes, navigation.status).await
+            let readiness = cdp.evaluate(&ready, Some(context)).await?;
+            document(cdp, max_bytes, navigation.status)
+                .await
+                .map(|response| (response, readiness["challenge_waited"] == true))
         }
         .await;
         for event in cdp.drain_events()? {
             navigation.observe(&event);
         }
-        let mut response = match extracted {
+        let (mut response, waited) = match extracted {
             Ok(_) if generation != navigation.generation => continue,
             Ok(response) => response,
             Err(error) if context_was_replaced(&error) => {
@@ -739,9 +774,17 @@ async fn navigate_document(
         if let Some(status) = navigation.status {
             response.status = reqwest::StatusCode::from_u16(status)?;
         }
+        ensure!(
+            !navigation.current_challenged,
+            "browser_challenge_unresolved: final document still has cf-mitigated=challenge"
+        );
         return Ok(Rendered {
             response,
-            warnings: vec![],
+            warnings: if waited || navigation.challenged {
+                vec!["Browser observed a challenge interstitial before this document; the resulting document still requires content validation".into()]
+            } else {
+                vec![]
+            },
             status_observed: navigation.status.is_some(),
         });
     }
@@ -764,8 +807,10 @@ struct Navigation {
     frame: String,
     committed: bool,
     status: Option<u16>,
-    pending_status: Option<(String, u16)>,
+    pending_status: Option<(String, u16, bool)>,
     generation: u64,
+    challenged: bool,
+    current_challenged: bool,
 }
 
 impl Navigation {
@@ -782,19 +827,36 @@ impl Navigation {
                 self.status = self
                     .pending_status
                     .as_ref()
-                    .filter(|(loader, _)| loader == &self.loader)
-                    .map(|(_, status)| *status);
+                    .filter(|(loader, _, _)| loader == &self.loader)
+                    .map(|(_, status, _)| *status);
+                self.current_challenged = self
+                    .pending_status
+                    .as_ref()
+                    .is_some_and(|(loader, _, challenged)| loader == &self.loader && *challenged);
+                self.challenged |= self.current_challenged;
             }
             Some("Network.responseReceived")
                 if params["type"] == "Document" && params["frameId"] == self.frame =>
             {
+                let challenged = params["response"]["headers"]
+                    .as_object()
+                    .is_some_and(|headers| {
+                        headers.iter().any(|(name, value)| {
+                            name.eq_ignore_ascii_case("cf-mitigated")
+                                && value
+                                    .as_str()
+                                    .is_some_and(|value| value.eq_ignore_ascii_case("challenge"))
+                        })
+                    });
                 if let (Some(loader), Some(status)) = (
                     params["loaderId"].as_str(),
                     params["response"]["status"].as_f64(),
                 ) {
-                    self.pending_status = Some((loader.into(), status as u16));
+                    self.pending_status = Some((loader.into(), status as u16, challenged));
                     if loader == self.loader {
                         self.status = Some(status as u16);
+                        self.current_challenged = challenged;
+                        self.challenged |= challenged;
                     }
                 }
             }
