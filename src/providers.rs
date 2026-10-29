@@ -30,6 +30,9 @@ pub struct Providers {
 }
 
 fn issue(source: &str, e: impl std::fmt::Display) -> Issue {
+    if matches!(source, "github" | "github-issues" | "github-code") {
+        return crate::github::issue(source, e);
+    }
     let message = e.to_string();
     if let Some(issue) = crate::browser::startup_issue(source, &message) {
         return issue;
@@ -325,6 +328,18 @@ impl Providers {
                 "arxiv" => crate::arxiv::search(&self.http, query, limit, since, &mut run).await,
                 "reddit" => self.search_reddit(query, limit, since, &mut run).await,
                 "youtube" => self.search_youtube(query, limit, since, &mut run).await,
+                "github" | "github-issues" | "github-code" => {
+                    crate::github::search(
+                        &self.http,
+                        source,
+                        query,
+                        limit,
+                        since,
+                        &mut run,
+                        progress.as_ref(),
+                    )
+                    .await
+                }
                 "crossref" | "europepmc" | "pubmed" => {
                     crate::scholarly::search(&self.http, source, query, limit, since, &mut run)
                         .await
@@ -341,16 +356,24 @@ impl Providers {
                     .await
                 }
                 _ => Err(anyhow!(
-                    "unsupported source {source}; supported sources: web, hn, reddit, youtube, arxiv, crossref, europepmc, pubmed"
+                    "unsupported source {source}; supported sources: web, hn, reddit, youtube, arxiv, crossref, europepmc, pubmed, github, github-issues, github-code"
                 )),
             }
         };
         match crate::net::within_budget(self.budget, task).await {
             Ok(Ok(())) => (),
-            Ok(Err(e)) => run.errors.push(issue(source, e)),
+            Ok(Err(e)) => {
+                if run.meta["github_search"]["stop_reason"] == "in_progress" {
+                    run.meta["github_search"]["stop_reason"] = json!("page_failed");
+                }
+                run.errors.push(issue(source, e));
+            }
             Err(_) => {
                 if run.meta["web_pagination"].is_object() {
                     run.meta["web_pagination"]["stop_reason"] = json!("deadline");
+                }
+                if run.meta["github_search"].is_object() {
+                    run.meta["github_search"]["stop_reason"] = json!("deadline");
                 }
                 run.errors.push(issue(
                     source,

@@ -88,6 +88,8 @@ fn cli(args: &[&str]) -> Command {
         .env("no_proxy", "127.0.0.1,localhost");
     for key in [
         "FFETCH_ARXIV_SEARCH",
+        "FFETCH_GITHUB_BASE",
+        "FFETCH_GITHUB_TOKEN",
         "FFETCH_ARXIV_PDF_BASE",
         "FFETCH_YOUTUBE_SEARCH",
         "FFETCH_YOUTUBE_WATCH",
@@ -1028,6 +1030,520 @@ fn deep_engine_failure_preserves_success_and_reports_missing_coverage() {
     assert_eq!(data["items"][0]["metrics"]["engine_count"], 1);
     assert_eq!(data["errors"][0]["source"], "engine:google");
     assert_eq!(data["meta"]["coverage"].as_array().unwrap().len(), 2);
+}
+
+fn github_repo(id: u64) -> Value {
+    json!({"id":id,"full_name":format!("lab/gripper{id}"),"html_url":format!("https://github.com/lab/gripper{id}"),"description":"Open gripper CAD","owner":{"login":"lab"},"default_branch":"main","stargazers_count":42,"forks_count":7,"open_issues_count":3,"created_at":"2026-01-01T00:00:00Z","pushed_at":"2026-10-29T10:00:00Z","topics":["robotics","cad"],"license":{"spdx_id":"MIT"}})
+}
+fn github_readme(id: u64, text: &str) -> Value {
+    use base64::Engine;
+    json!({"type":"file","name":"README.md","path":"README.md","sha":"a".repeat(40),"size":text.len(),"encoding":"base64","content":base64::engine::general_purpose::STANDARD.encode(text),"html_url":format!("https://github.com/lab/gripper{id}/blob/main/README.md")})
+}
+fn github_issue() -> Value {
+    json!({"id":91,"number":7,"html_url":"https://github.com/lab/gripper1/pull/7","title":"Improve force control","body":"Measured **4 N** tendon force.","pull_request":{"url":"https://api.github.com/repos/lab/gripper1/pulls/7"},"user":{"login":"ada"},"created_at":"2026-10-29T10:00:00Z","comments":150,"state":"open"})
+}
+
+#[test]
+fn github_repository_search_paginates_filters_exact_times_and_reports_incomplete_results() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = Fixture::new(move |path| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        let url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+        assert_eq!(url.path(), "/search/repositories");
+        let args = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(args["per_page"], "3");
+        assert!(args["q"].contains("gripper language:Rust pushed:>=2026-10-29"));
+        let first = args["page"] == "1";
+        let mut old = github_repo(2);
+        old["pushed_at"] = json!("2026-10-29T08:00:00Z");
+        let items = if first {
+            vec![github_repo(1), old, github_repo(1)]
+        } else {
+            vec![github_repo(3), github_repo(4), github_repo(5)]
+        };
+        (
+            200,
+            "application/json",
+            json!({"total_count":6,"incomplete_results":!first,"items":items}).to_string(),
+        )
+    });
+    let output = cli(&[
+        "search",
+        "gripper language:Rust",
+        "--sources",
+        "github",
+        "--limit",
+        "3",
+        "--since",
+        "2026-10-29T09:00:00Z",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &server.base)
+    .output()
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert_eq!(run["items"].as_array().unwrap().len(), 3);
+    assert_eq!(run["items"][0]["metrics"]["stars"], 42);
+    assert_eq!(run["items"][0]["content"]["license"], "MIT");
+    assert_eq!(run["items"][1]["content"]["repository"], "lab/gripper3");
+    assert_eq!(run["errors"][0]["code"], "github_search_incomplete");
+    assert_eq!(
+        run["meta"]["coverage"][0]["meta"]["github_search"]["pages_completed"],
+        2
+    );
+    assert_eq!(
+        run["meta"]["coverage"][0]["meta"]["github_search"]["stop_reason"],
+        "result_limit"
+    );
+}
+
+#[test]
+fn github_search_rejects_unknown_schemas_and_keeps_completed_pages_on_failure() {
+    let server = Fixture::new(|path| {
+        let url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+        let args = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let query = args["q"].as_ref();
+        if query == "bad" {
+            (
+                200,
+                "application/json",
+                "{\"message\":\"Unexpected API shape\"}".into(),
+            )
+        } else if query == "empty" {
+            (
+                200,
+                "application/json",
+                json!({"total_count":0,"incomplete_results":false,"items":[]}).to_string(),
+            )
+        } else if args["page"] == "2" {
+            (
+                403,
+                "application/json",
+                json!({"message":"API rate limit exceeded"}).to_string(),
+            )
+        } else {
+            (200,"application/json",json!({"total_count":10,"incomplete_results":false,"items":[github_repo(1),github_repo(1)]}).to_string())
+        }
+    });
+    for (query, code, count) in [("bad", 1, 0), ("empty", 0, 0), ("later-failure", 3, 1)] {
+        let output = cli(&[
+            "search",
+            query,
+            "--sources",
+            "github",
+            "--limit",
+            "2",
+            "--no-store",
+        ])
+        .env("FFETCH_GITHUB_BASE", &server.base)
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        let run = parsed(&output);
+        assert_eq!(run["items"].as_array().unwrap().len(), count);
+        if query == "later-failure" {
+            assert_eq!(run["errors"][0]["code"], "rate_limited");
+        }
+    }
+}
+
+#[test]
+fn github_native_repository_read_retains_readme_bytes_and_distinct_provenance() {
+    let text = "# Open gripper\nTorque: 4 N m.\n";
+    let server = Fixture::new(move |path| {
+        if path.starts_with("/repos/lab/gripper1/readme") {
+            (200, "application/json", github_readme(1, text).to_string())
+        } else {
+            assert_eq!(path, "/repos/lab/gripper1");
+            (200, "application/json", github_repo(1).to_string())
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let output = cli(&["fetch", "https://github.com/lab/gripper1"])
+        .env("FFETCH_GITHUB_BASE", &server.base)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    let readme = &run["items"][1];
+    assert_eq!(readme["text"], text);
+    assert_eq!(readme["kind"], "repository_readme");
+    assert_eq!(readme["provenance"]["locator"], "file:README.md");
+    assert_eq!(readme["content"]["parent_id"], run["items"][0]["id"]);
+    assert_ne!(
+        readme["provenance"]["artifact"],
+        run["items"][0]["provenance"]["artifact"]
+    );
+    let raw = cli(&[
+        "artifact",
+        readme["provenance"]["artifact"].as_str().unwrap(),
+    ])
+    .arg("--data-dir")
+    .arg(dir.path())
+    .output()
+    .unwrap();
+    let raw: Value = serde_json::from_slice(&raw.stdout).unwrap();
+    assert_eq!(raw["encoding"], "base64");
+    let original = cli(&[
+        "artifact",
+        readme["content"]["text_artifact"].as_str().unwrap(),
+    ])
+    .arg("--data-dir")
+    .arg(dir.path())
+    .output()
+    .unwrap();
+    assert_eq!(original.stdout, text.as_bytes());
+    assert_eq!(run["meta"]["http"]["requests_started"], 2);
+}
+
+#[test]
+fn github_thread_paginates_bounded_issue_comments_and_preserves_pull_identity() {
+    let server = Fixture::new(|path| {
+        if path.starts_with("/repos/lab/gripper1/issues/7/comments?") {
+            let ids = if path.contains("page=2") {
+                vec![100, 101, 102]
+            } else {
+                (1..=100).collect()
+            };
+            let comments = ids.into_iter().map(|id|json!({"id":id,"html_url":format!("https://github.com/lab/gripper1/pull/7#issuecomment-{id}"),"body":format!("Measurement {id}"),"user":{"login":"ada"}})).collect::<Vec<_>>();
+            (200, "application/json", json!(comments).to_string())
+        } else {
+            (200, "application/json", github_issue().to_string())
+        }
+    });
+    let output = cli(&[
+        "thread",
+        "https://github.com/lab/gripper1/pull/7",
+        "--limit",
+        "101",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &server.base)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    let items = run["items"].as_array().unwrap();
+    assert_eq!(items.len(), 102);
+    assert_eq!(items[0]["kind"], "pull_request");
+    assert_eq!(items[101]["text"], "Measurement 101");
+    assert_eq!(items[101]["content"]["parent_id"], items[0]["id"]);
+    assert_eq!(run["meta"]["targets"], Value::Null);
+    assert_eq!(run["meta"]["comments_returned"], 101);
+    assert_eq!(run["meta"]["stop_reason"], "comment_limit");
+    assert_eq!(run["meta"]["http"]["requests_started"], 3);
+}
+
+#[test]
+fn github_read_rejects_mismatched_identity_and_keeps_metadata_when_readme_is_unavailable() {
+    for mode in ["identity", "readme-absent", "bad-base64"] {
+        let server = Fixture::new(move |path| {
+            if path.contains("/readme") {
+                if mode == "readme-absent" {
+                    (
+                        404,
+                        "application/json",
+                        "{\"message\":\"Not Found\"}".into(),
+                    )
+                } else {
+                    let mut data = github_readme(1, "text");
+                    data["content"] = json!("invalid base64!");
+                    (200, "application/json", data.to_string())
+                }
+            } else {
+                (
+                    200,
+                    "application/json",
+                    github_repo(if mode == "identity" { 2 } else { 1 }).to_string(),
+                )
+            }
+        });
+        let output = cli(&["fetch", "https://github.com/lab/gripper1", "--no-store"])
+            .env("FFETCH_GITHUB_BASE", &server.base)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if mode == "identity" {
+                1
+            } else if mode == "readme-absent" {
+                0
+            } else {
+                3
+            })
+        );
+        let run = parsed(&output);
+        assert_eq!(
+            run["items"].as_array().unwrap().len(),
+            if mode == "identity" { 0 } else { 1 }
+        );
+        if mode == "identity" {
+            assert_eq!(run["errors"][0]["code"], "identity_mismatch");
+        }
+    }
+}
+
+#[test]
+fn github_credentials_are_not_sent_to_overrides_and_code_search_requires_explicit_auth() {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = Fixture::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        (200, "application/json", "{}".into())
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "github-code",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &server.base)
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        parsed(&output)["errors"][0]["code"],
+        "authentication_required"
+    );
+    let output = cli(&["search", "gripper", "--sources", "github", "--no-store"])
+        .env("FFETCH_GITHUB_BASE", &server.base)
+        .env("FFETCH_GITHUB_TOKEN", "fixture-secret-do-not-persist")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        parsed(&output)["errors"][0]["code"],
+        "credential_origin_rejected"
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret-do-not-persist"));
+}
+
+#[test]
+fn github_api_failure_uses_ordinary_retrieval_without_discarding_the_native_error() {
+    let api = Fixture::new(|_| {
+        (
+            503,
+            "application/json",
+            json!({"message":"API unavailable"}).to_string(),
+        )
+    });
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = reads.clone();
+    let proxy = Fixture::new(move |path| {
+        assert_eq!(path, "http://github.com/lab/gripper1");
+        observed.fetch_add(1, Ordering::Relaxed);
+        (
+            200,
+            "text/html",
+            "<article>Public repository recovery evidence</article>".into(),
+        )
+    });
+    let output = cli(&[
+        "fetch",
+        "http://github.com/lab/gripper1",
+        "--archive",
+        "off",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &api.base)
+    .env("HTTP_PROXY", &proxy.base)
+    .env("http_proxy", &proxy.base)
+    .output()
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert!(
+        run["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("recovery evidence")
+    );
+    assert_eq!(run["items"][0]["kind"], "document");
+    assert_eq!(run["errors"][0]["source"], "github");
+    assert!(
+        run["meta"]["targets"][0]["selected_representation"]
+            .as_str()
+            .unwrap()
+            .contains("fallback")
+    );
+}
+
+#[test]
+fn github_readme_requests_overlap_metadata_and_preserve_it_at_the_shared_deadline() {
+    let readme_started = Arc::new(AtomicBool::new(false));
+    let release_readme = Arc::new(AtomicBool::new(false));
+    let observed = readme_started.clone();
+    let release = release_readme.clone();
+    let server = Fixture::new(move |path| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        if path.ends_with("/readme") {
+            observed.store(true, Ordering::Relaxed);
+            while !release.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            (
+                200,
+                "application/json",
+                github_readme(1, "late README").to_string(),
+            )
+        } else {
+            while !observed.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            (200, "application/json", github_repo(1).to_string())
+        }
+    });
+    let output = cli(&[
+        "fetch",
+        "https://github.com/lab/gripper1",
+        "--timeout",
+        "1",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &server.base)
+    .output()
+    .unwrap();
+    release_readme.store(true, Ordering::Relaxed);
+    assert!(readme_started.load(Ordering::Relaxed));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 1);
+    assert_eq!(run["items"][0]["kind"], "repository");
+    assert_eq!(run["errors"][0]["code"], "deadline_exceeded");
+    assert_eq!(run["meta"]["http"]["requests_started"], 2);
+}
+
+#[test]
+fn github_search_streams_pages_into_deduplicated_native_readme_reads() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = reads.clone();
+    let server = Fixture::new(move |path| {
+        if path.starts_with("/search/repositories?") {
+            let parsed_url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+            let second = parsed_url
+                .query_pairs()
+                .any(|(key, value)| key == "page" && value == "2");
+            if second {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while observed.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if observed.load(Ordering::Relaxed) == 0 {
+                    return (
+                        503,
+                        "application/json",
+                        "{\"message\":\"README reads waited for search completion\"}".into(),
+                    );
+                }
+            }
+            (200,"application/json",json!({"total_count":3,"incomplete_results":false,"items":if second {vec![github_repo(2)]}else{vec![github_repo(1),github_repo(1)]}}).to_string())
+        } else if path.contains("/readme") {
+            observed.fetch_add(1, Ordering::Relaxed);
+            (
+                200,
+                "application/json",
+                github_readme(
+                    if path.contains("gripper2") { 2 } else { 1 },
+                    "Gripper CAD body",
+                )
+                .to_string(),
+            )
+        } else {
+            (
+                200,
+                "application/json",
+                github_repo(if path.contains("gripper2") { 2 } else { 1 }).to_string(),
+            )
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--query",
+        "tendon",
+        "--sources",
+        "github",
+        "--limit",
+        "2",
+        "--read",
+        "--format",
+        "jsonl",
+        "--no-store",
+    ])
+    .env("FFETCH_GITHUB_BASE", &server.base)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let records = events
+        .iter()
+        .filter(|e| e["type"] == "record")
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 6);
+    let ids = records
+        .iter()
+        .map(|e| e["item"]["id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), records.len());
+    assert_eq!(
+        records
+            .iter()
+            .filter(|e| e["item"]["kind"] == "repository_readme")
+            .count(),
+        2
+    );
+    assert!(
+        records
+            .iter()
+            .filter(|e| e["item"]["kind"] == "repository_readme")
+            .all(|e| e["item"]["native"]["discovered_from"].is_string())
+    );
 }
 
 fn pdf_fixture(texts: &[&str], compress: bool) -> Vec<u8> {

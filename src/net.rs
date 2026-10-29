@@ -291,11 +291,48 @@ impl Http {
         }
         self.get_authorized(url, token, true).await
     }
+    pub async fn github_get(
+        &self,
+        url: Url,
+        token: Option<&str>,
+        search: bool,
+    ) -> Result<Response> {
+        if token.is_some() {
+            ensure!(
+                url.scheme() == "https"
+                    && url.host_str() == Some("api.github.com")
+                    && url.port().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "GitHub bearer credentials require the official HTTPS API origin"
+            );
+        }
+        self.get_profile(
+            url,
+            token,
+            true,
+            Some(if search {
+                "application/vnd.github.text-match+json"
+            } else {
+                "application/vnd.github+json"
+            }),
+        )
+        .await
+    }
     async fn get_authorized(
         &self,
         url: Url,
         token: Option<&str>,
         allow_retry: bool,
+    ) -> Result<Response> {
+        self.get_profile(url, token, allow_retry, None).await
+    }
+    async fn get_profile(
+        &self,
+        url: Url,
+        token: Option<&str>,
+        allow_retry: bool,
+        accept: Option<&'static str>,
     ) -> Result<Response> {
         let own = Instant::now()
             .checked_add(self.timeout)
@@ -305,7 +342,7 @@ impl Http {
         let mut last_status = None;
         let result = tokio::time::timeout_at(
             deadline,
-            self.get_loop(url, token, deadline, allow_retry, &mut last_status),
+            self.get_loop(url, token, deadline, allow_retry, &mut last_status, accept),
         )
         .await;
         // Let the enclosing timeout cancel unfinished work at its deadline.
@@ -331,6 +368,7 @@ impl Http {
         deadline: Instant,
         allow_retry: bool,
         last_status: &mut Option<StatusCode>,
+        mut accept: Option<&'static str>,
     ) -> Result<Response> {
         let mut redirects = 0;
         let mut retried = false;
@@ -346,6 +384,11 @@ impl Http {
             let origin = self.origin(&url);
             let (_local, _global) = self.acquire(&origin, deadline).await?;
             let mut request = self.client.get(url.clone());
+            if let Some(accept) = accept {
+                request = request
+                    .header("Accept", accept)
+                    .header("X-GitHub-Api-Version", "2022-11-28");
+            }
             if let Some(token) = token {
                 request = request.bearer_auth(token);
             }
@@ -404,6 +447,7 @@ impl Http {
                 );
                 if url.origin() != next.origin() {
                     token = None;
+                    accept = None;
                 }
                 if let Some(delay) = delay {
                     // Retry-After on 3xx delays this redirect, not unrelated work at
@@ -493,6 +537,44 @@ impl Http {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn github_requests_pin_the_api_and_select_text_match_media_only_for_search() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", server.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            for search in [false, true] {
+                let (mut socket, _) = server.accept().unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains("x-github-api-version: 2022-11-28"));
+                assert!(request.contains(if search {
+                    "accept: application/vnd.github.text-match+json"
+                } else {
+                    "accept: application/vnd.github+json"
+                }));
+                assert!(!request.contains("authorization:"));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        });
+        let http = Http::new(Duration::from_secs(2), 4096, 2).unwrap();
+        for search in [false, true] {
+            http.github_get(Url::parse(&base).unwrap(), None, search)
+                .await
+                .unwrap();
+        }
+        task.join().unwrap();
+    }
     #[test]
     fn retry_after_accepts_http_dates_and_rejects_malformed_delays() {
         let now = chrono::DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:36 GMT")

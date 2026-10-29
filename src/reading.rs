@@ -30,7 +30,16 @@ impl Planner {
             .as_str()
             .unwrap_or(&record.url)
             .to_owned();
-        let identity = research::identity(record).unwrap_or_else(|| extract::canonical(&url));
+        let identity = crate::github::target(&url)
+            .map(|target| {
+                format!(
+                    "github:{}:{:?}",
+                    target.repository.to_ascii_lowercase(),
+                    target.number
+                )
+            })
+            .or_else(|| research::identity(record))
+            .unwrap_or_else(|| extract::canonical(&url));
         let pmcid = record.content["pmcid"]
             .as_str()
             .and_then(fulltext::pmcid)
@@ -106,6 +115,59 @@ pub async fn arxiv_read(fetcher: &Fetcher, input: &str) -> Run {
             run
         }
     }
+}
+
+pub async fn github_read(
+    fetcher: &Fetcher,
+    input: &str,
+    target: &crate::github::Target,
+    comments: bool,
+    limit: usize,
+    archive: Archive,
+) -> Run {
+    let started = Instant::now();
+    let mut run = crate::github::read_run(target, comments, limit);
+    let task = async {
+        if let Err(error) = crate::github::read(
+            &fetcher.http,
+            target,
+            comments,
+            limit,
+            fetcher.store.as_ref(),
+            &mut run,
+        )
+        .await
+        {
+            run.errors.push(crate::github::issue("github", error));
+        }
+        if run.items.is_empty()
+            && !run.errors.iter().any(|issue| {
+                matches!(
+                    issue.code.as_str(),
+                    "identity_mismatch" | "credential_origin_rejected" | "authentication_required"
+                )
+            })
+        {
+            let fallback = fetcher
+                .fetch(
+                    input,
+                    &Options::default(),
+                    crate::github::archive_policy(input, archive),
+                )
+                .await;
+            run.meta["github_native"] = run.meta.clone();
+            run.meta["fallback"] = fallback.meta.clone();
+            run.meta["selected_representation"] =
+                json!("ordinary retrieval fallback; native GitHub data unavailable");
+            run.merge(fallback);
+        }
+    };
+    if net::within_budget(fetcher.budget, task).await.is_err() {
+        run.meta["stop_reason"] = json!("deadline");
+        run.errors.push(Issue::new("github","deadline_exceeded","GitHub API and ordinary retrieval exceeded their shared timeout; completed evidence retained"));
+    }
+    run.finish(started.elapsed().as_millis() as u64);
+    run
 }
 
 async fn finish_read(fetcher: &Fetcher, target: &Target, run: &mut Run) {

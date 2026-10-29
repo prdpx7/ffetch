@@ -176,7 +176,7 @@ enum Command {
         #[arg(long, default_value="day", value_parser=["hour","day","week","month","year","all"])]
         period: String,
     },
-    /// Read a Hacker News or Reddit post and its bounded comment tree.
+    /// Read a Hacker News, Reddit, or GitHub issue conversation.
     Thread {
         /// Numeric HN item ID or an HN item URL.
         input: String,
@@ -216,13 +216,13 @@ struct FetchArgs {
     archive: Archive,
     #[arg(long, default_value="25", value_parser=parse_positive)]
     archive_limit: usize,
-    /// Native HN/Reddit enrichment. Supported values: article,comments.
+    /// Native enrichment. Comments support HN, Reddit, and GitHub issues.
     #[arg(long, value_delimiter=',', value_parser=["article","comments","transcript"])]
     include: Vec<String>,
     /// Caption language when --include transcript is used for YouTube.
     #[arg(long, default_value = "en")]
     language: String,
-    /// Maximum comments per HN thread.
+    /// Maximum comments per native thread.
     #[arg(long, default_value="100", value_parser=parse_positive)]
     limit: usize,
 }
@@ -589,10 +589,11 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                 let providers = &providers;
                 let options = &options;
                 async move {
+                    let archive = ffetch::github::archive_policy(url, args.archive);
                     if args.include.iter().any(|s| s == "transcript")
                         && ffetch::youtube::video_id(url).is_none()
                     {
-                        let mut result = fetcher.fetch(url, options, args.archive).await;
+                        let mut result = fetcher.fetch(url, options, archive).await;
                         result.errors.push(Issue::new(
                             "web",
                             "unsupported_enrichment",
@@ -603,17 +604,33 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                     let id = net::normalize(url)
                         .ok()
                         .and_then(|url| providers::hn_id(&url));
-                    if let Some(id) = ffetch::arxiv::paper_id(url).filter(|_| {
+                    if let Some(target) = ffetch::github::body_target(url).filter(|_| {
+                        cli.browser != browser::Mode::Always
+                            && cli.session.is_none()
+                            && options.css.is_none()
+                            && matches!(options.mode, Extract::Article)
+                            && archive != Archive::LatestValid
+                    }) {
+                        ffetch::reading::github_read(
+                            fetcher,
+                            url,
+                            &target,
+                            args.include.iter().any(|s| s == "comments"),
+                            args.limit,
+                            archive,
+                        )
+                        .await
+                    } else if let Some(id) = ffetch::arxiv::paper_id(url).filter(|_| {
                         !net::normalize(url).is_ok_and(|url| url.path().starts_with("/pdf/"))
                             && options.css.is_none()
                             && matches!(options.mode, Extract::Article)
-                            && args.archive != Archive::LatestValid
+                            && archive != Archive::LatestValid
                     }) {
                         providers.arxiv_paper(&id).await
                     } else if let Some(id) = ffetch::youtube::video_id(url).filter(|_| {
                         options.css.is_none()
                             && matches!(options.mode, Extract::Article)
-                            && args.archive != Archive::LatestValid
+                            && archive != Archive::LatestValid
                     }) {
                         let transcript = args.include.iter().any(|s| s == "transcript");
                         let mut video = providers
@@ -627,7 +644,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                             ));
                         }
                         if video.items.is_empty() && !transcript {
-                            let mut fallback = fetcher.fetch(url, options, args.archive).await;
+                            let mut fallback = fetcher.fetch(url, options, archive).await;
                             if args.include.iter().any(|s| s == "comments") {
                                 fallback.errors.extend(video.errors);
                             } else {
@@ -646,12 +663,12 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                     } else if let Some(id) = ffetch::reddit::thread_id(url).filter(|_| {
                         options.css.is_none()
                             && matches!(options.mode, Extract::Article)
-                            && args.archive != Archive::LatestValid
+                            && archive != Archive::LatestValid
                     }) {
                         let comments = args.include.iter().any(|s| s == "comments");
                         let mut thread = providers.reddit_thread(&id, comments, args.limit).await;
                         if thread.items.is_empty() {
-                            let mut fallback = fetcher.fetch(url, options, args.archive).await;
+                            let mut fallback = fetcher.fetch(url, options, archive).await;
                             fallback.meta["reddit_native_available"] = json!(false);
                             let mut attempts = thread.attempts;
                             attempts.append(&mut fallback.attempts);
@@ -674,14 +691,14 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                                     .and_then(|r| r.content["article_url"].as_str())
                                     .map(str::to_owned)
                             {
-                                thread.merge(fetcher.fetch(&link, options, args.archive).await);
+                                thread.merge(fetcher.fetch(&link, options, archive).await);
                             }
                             thread
                         }
                     } else if let Some(id) = id.filter(|_| {
                         options.css.is_none()
                             && matches!(options.mode, Extract::Article)
-                            && args.archive != Archive::LatestValid
+                            && archive != Archive::LatestValid
                     }) {
                         let mut thread = providers
                             .hn_thread(id, args.include.iter().any(|s| s == "comments"), args.limit)
@@ -693,11 +710,11 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                                 .and_then(|r| r.content["article_url"].as_str())
                                 .map(str::to_owned)
                         {
-                            thread.merge(fetcher.fetch(&url, options, args.archive).await);
+                            thread.merge(fetcher.fetch(&url, options, archive).await);
                         }
                         thread
                     } else {
-                        fetcher.fetch(url, options, args.archive).await
+                        fetcher.fetch(url, options, archive).await
                     }
                 }
             });
@@ -789,13 +806,31 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                         async move {
                             let fetched = if target.pmcid.is_some() {
                                 ffetch::reading::fulltext_read(fetcher, &target).await
+                            } else if let Some(github) = ffetch::github::body_target(&target.url)
+                                .filter(|_| {
+                                    cli.browser != browser::Mode::Always && cli.session.is_none()
+                                })
+                            {
+                                ffetch::reading::github_read(
+                                    fetcher,
+                                    &target.url,
+                                    &github,
+                                    false,
+                                    100,
+                                    Archive::Auto,
+                                )
+                                .await
                             } else if ffetch::arxiv::paper_id(&target.url).is_some() {
                                 ffetch::reading::arxiv_read(fetcher, &target.url).await
                             } else if let Some(id) = ffetch::youtube::video_id(&target.url) {
                                 providers.youtube_video(&id, None).await
                             } else {
                                 fetcher
-                                    .fetch(&target.url, &Options::default(), Archive::Auto)
+                                    .fetch(
+                                        &target.url,
+                                        &Options::default(),
+                                        ffetch::github::archive_policy(&target.url, Archive::Auto),
+                                    )
                                     .await
                             };
                             (target.parent, fetched)
@@ -909,7 +944,17 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
             video
         }
         Command::Thread { input, limit } => {
-            if let Some(id) = ffetch::reddit::thread_id(input) {
+            if let Some(github) = ffetch::github::target(input).filter(|t| t.number.is_some()) {
+                ffetch::github::fetch(
+                    &providers.http,
+                    &github,
+                    true,
+                    *limit,
+                    fetcher.store.as_ref(),
+                    timeout,
+                )
+                .await
+            } else if let Some(id) = ffetch::reddit::thread_id(input) {
                 providers.reddit_thread(&id, true, *limit).await
             } else {
                 let id = input
@@ -920,7 +965,7 @@ async fn execute(cli: &Cli, query: &query::Query) -> Result<u8> {
                             .ok()
                             .and_then(|url| providers::hn_id(&url))
                     })
-                    .context("thread expects an HN ID/URL, a Reddit URL, or reddit:POST_ID")?;
+                    .context("thread expects an HN ID/URL, a Reddit URL, reddit:POST_ID, or a GitHub issue/pull URL")?;
                 providers.hn_thread(id, true, *limit).await
             }
         }
@@ -1275,7 +1320,7 @@ fn write_csv(out: &mut impl Write, value: &Value) -> Result<()> {
 fn capabilities() -> Value {
     json!({
         "schema":model::SCHEMA_VERSION,"version":env!("CARGO_PKG_VERSION"),
-        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":true,"search_read":"versioned PDF; no repeated Atom lookup"},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
+        "sources":{"web":{"fetch":true,"search":true,"search_providers":["brave-html","duckduckgo-html","google-html","bing-html","yandex-html","baidu-html","searxng (configured)"],"pagination":{"engines":["brave","bing","google"],"flag":"--search-pages","default_pages":1,"maximum_pages":20,"page_streaming":true,"progress_queue_bounded":true,"full_run_collected":true,"coverage":"bounded; missing next link does not prove exhaustion"},"default_mode":"balanced","deep":"concurrent engine fanout with reciprocal-rank fusion and origins; HTML availability varies","fast":"Brave starts first; DuckDuckGo hedges after 300ms; first validated response wins"},"reddit":{"search":true,"community":true,"feeds":["hot","new","top","rising"],"threads":true,"morechildren_expansion":false,"oauth_bearer_optional":true,"public_access_may_be_blocked":true,"blocked_search_fallback":"scoped web discovery with partial status and no native metrics"},"arxiv":{"search":true,"pagination":true,"versioned_metadata":true,"abstracts":true,"pdf_links":true,"pdf_text":true,"search_read":"versioned PDF; no repeated Atom lookup"},"crossref":{"search":true,"cursor_pagination":true,"metadata":true,"full_text":false},"europepmc":{"search":true,"cursor_pagination":true,"abstracts_when_available":true},"pubmed":{"search":true,"adapter":"europepmc SRC:MED","abstracts_when_available":true},"hn":{"search":true,"feeds":["top","new","best","ask","show"],"threads":true,"search_pagination":true},"github":{"repository_search":true,"issue_search_source":"github-issues","code_search_source":"github-code","code_search_authentication_required":true,"code_search_full_files":false,"repository_metadata":true,"readme_text":true,"parallel_metadata_readme":true,"issue_conversations":true,"pull_request_review_comments":false,"pagination":true,"search_page_streaming":true,"api_search_result_cap":1000,"search_read_native":true,"since":{"repositories":"pushed_at","issues":"created_at","code":false},"optional_token_env":"FFETCH_GITHUB_TOKEN","credential_origin":"https://api.github.com","local_gh_credentials":false,"live_authenticated_access_validated":false,"api_version":"2022-11-28","ordinary_read_fallback":"HTTP/browser/archive under the same deadline; API error retained"},"wayback":{"recovery":true,"validation":true,"global_latest_guarantee":false}},
         "pdf":{"command":"pdf","parser":"lopdf 0.46","external_runtime":false,"isolated_worker":true,"unix_address_space_limit_bytes":536870912,"default_pages":20,"maximum_pages":500,"ocr":false,"layout_verified":false,"automatic_fetch":true,"automatic_modes":["article","text"],"detection":"response signature or MIME type; not URL suffix","single_download":true,"reuse_stored_artifact":true,"search_read_automatic":true},
         "fulltext":{"command":"fulltext","provider":"europepmc","input":"PMCID or supported PMC article URL","format":"JATS XML","body_text":true,"blocks":true,"tables":true,"original_artifact":true,"pdf":false,"images":false,"math_layout_complete":false,"external_entities":false,"search_read_automatic":true,"trigger":"PMCID metadata or supported PMC URL","doi_assertion_check":true},
         "citations":{"command":"references","provider":"crossref","direction":"references","maximum_depth":3,"default_reference_budget":20,"lookup_bound":"one seed plus at most the reference-entry budget","fuzzy_matching":false,"full_text":false,"graph":"meta.edges","streaming":false},

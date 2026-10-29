@@ -178,6 +178,9 @@ may remain unresolved. Output is collected until traversal completes.
 | `hn` | Search, feeds, stories, bounded comment trees |
 | `reddit` | Community search, feeds, posts, bounded comment trees |
 | `youtube` | Video search, metadata, available captions, API popular rankings |
+| `github` | Repository search, metadata, available README text |
+| `github-issues` | Issue and pull request search, issue conversation comments |
+| `github-code` | Authenticated code search with available text-match snippets |
 | `arxiv` | Preprint search, versioned metadata, abstracts, categories, PDF text |
 | `crossref` | DOI metadata, available abstracts, references, resource links |
 | `europepmc` | Publication metadata, available abstracts, full-text links |
@@ -207,6 +210,63 @@ Search `--read` fetches the PDF for each discovered version without another
 metadata lookup. Requests to its API are
 serialized at three-second intervals within one process. Avoid parallel arXiv
 CLI processes; cross-process rate coordination is not implemented.
+
+```sh
+ffetch search 'gripper robotics' --sources github --limit 5 --read
+```
+
+```sh
+ffetch search 'repo:tokio-rs/tokio is:issue is:open' --sources github-issues --limit 10
+```
+
+```sh
+ffetch search 'force_limit language:Rust' --sources github-code --limit 10
+```
+
+GitHub queries retain native search qualifiers. Repository `--since` filters by
+push time; issue `--since` filters by creation time. A date qualifier narrows the
+API request, then returned timestamps enforce the requested cutoff. Code search
+rejects `--since`. Results are paginated within the provider deadline and GitHub's
+1,000-result search cap. Completed pages stream into `--read`. API-reported
+incomplete results retain partial status. This searches GitHub's API index, with
+its indexing restrictions, rather than every repository or branch.
+
+Public repository and issue search can run without credentials. Code search
+requires `FFETCH_GITHUB_TOKEN`. Its access permissions determine which resources
+are available. The token is sent only to the official HTTPS API origin; endpoint
+overrides cannot receive it. ffetch does not read local `gh` credentials.
+Live authenticated access has not been validated. See the [GitHub search API](https://docs.github.com/en/rest/search/search)
+for authentication, rate limits, and indexing restrictions.
+
+```sh
+ffetch fetch https://github.com/prdpx7/ffetch
+```
+
+Repository roots use native metadata and README reads for default article
+extraction. The two requests overlap. README text stays in its original UTF-8
+format; records include the reported file path and blob SHA. The default branch
+is mutable and the read is not an atomic repository snapshot. Source files,
+releases, and discussions are not enumerated. Code-search results contain
+snippets, not full files; other GitHub paths and individual comment anchors use
+ordinary retrieval.
+
+```sh
+ffetch thread https://github.com/tokio-rs/tokio/issues/8733 --limit 100
+```
+
+Issue and pull request reads retain their Markdown body. `thread` and
+`fetch --include comments` retrieve a bounded issue conversation, retaining
+parents and partial records on failure. Pull request review comments are separate
+and are not fetched. Repository and thread reads save original API artifacts;
+README reads also save decoded file bytes, unless `--no-store` is used.
+
+When no native GitHub records are retrieved, ordinary HTTP, browser, and archive
+recovery share the same deadline and retain the API error. Identity mismatches
+and credential errors remain explicit. CSS scopes, other extraction modes,
+`--browser always`, and named sessions use ordinary retrieval directly.
+With a GitHub token configured, automatic recovery skips external archives to
+avoid disclosing private repository paths. An explicit `--archive latest-valid`
+request still allows an archive lookup.
 
 ```sh
 ffetch search "robot gripper" --sources reddit --community robotics
