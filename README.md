@@ -25,6 +25,11 @@ The default sources are web search and Hacker News. Balanced web search gathers
 Brave, Bing, and DuckDuckGo concurrently. Duplicate URLs retain each engine's
 rank, snippet, and provenance. Final web ranking uses reciprocal rank fusion.
 
+DuckDuckGo HTTP search uses a browser-compatible User-Agent header. TLS and HTTP
+remain on the ordinary Rust transport; this does not execute JavaScript or
+provide full browser impersonation. Other HTTP requests retain ffetch's default
+User-Agent. The selected search profile is included in coverage metadata.
+
 ```sh
 ffetch search "robot gripper" --query "underactuated tendon gripper" --query "open source gripper CAD" --sources web,papers --engines brave,bing --max-searches 15
 ```
@@ -113,6 +118,9 @@ capped at 15 seconds. arXiv uses its own spacing gate without an automatic retry
 remaining origin cooldowns. It records origins without paths, queries, or bearer
 tokens. These counters cover ffetch's HTTP client; browser network traffic and
 other CLI processes use separate state.
+`responses_by_protocol` counts response headers observed through HTTP/1, HTTP/2,
+or another negotiated protocol. A body can still fail after its headers arrive.
+These are client-side observations; a proxy can use another protocol upstream.
 
 ## Research sources
 

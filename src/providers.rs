@@ -48,7 +48,9 @@ fn issue(source: &str, e: impl std::fmt::Display) -> Issue {
     };
     let mut issue = Issue::new(source, code, message);
     issue.retryable = true;
-    issue.next_action = if code != "provider_failed" {
+    issue.next_action = if code == "rate_limited" {
+        Some("Honor Retry-After when provided; otherwise the server reset time is unknown. Use another source while waiting".into())
+    } else if code != "provider_failed" {
         Some("Inspect meta.http.origins[].cooldown_remaining_ms before retrying; use another source while this origin is cooling down".into())
     } else {
         Some(
@@ -644,6 +646,9 @@ impl Providers {
             run.meta["web_pagination"]["pages"].as_array_mut().unwrap().push(json!({"page":page+1,"meta":branch.meta,"status":if result.is_ok(){"ok"}else{"error"}}));
             run.meta["search_url"] = branch.meta["search_url"].clone();
             run.meta["retrieval_route"] = branch.meta["retrieval_route"].clone();
+            if let Some(profile) = branch.meta.get("request_profile") {
+                run.meta["request_profile"] = profile.clone();
+            }
             run.merge(branch);
             if result.is_ok() {
                 run.meta["web_pagination"]["pages_completed"] = json!(page + 1);
@@ -1011,7 +1016,19 @@ impl Providers {
         let mut url = self.web_search.clone();
         url.query_pairs_mut().append_pair("q", query);
         run.meta["search_url"] = json!(url.as_str());
-        let response = self.search_response(url.clone()).await?;
+        let profile = if self.browser_only {
+            "chromium-dom"
+        } else {
+            "chrome152-user-agent-only"
+        };
+        run.meta["request_profile"] = json!(profile);
+        let response = if self.browser_only {
+            self.search_response(url.clone()).await?
+        } else {
+            self.http
+                .get_with_browser_user_agent(url.clone(), true)
+                .await?
+        };
         ensure!(
             response.status.is_success(),
             "web search returned HTTP {}",

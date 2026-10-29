@@ -25,6 +25,11 @@ impl Fixture {
         })
     }
     fn bytes(route: impl Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static) -> Self {
+        Self::request(move |path, _| route(path))
+    }
+    fn request(
+        route: impl Fn(&str, &str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -46,7 +51,7 @@ impl Fixture {
                             }
                             let request = String::from_utf8_lossy(&request);
                             let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
-                            let (status,mime,body) = route(path);
+                            let (status,mime,body) = route(path,&request);
                             let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
                             let _ = socket.write_all(response.as_bytes());
                             let _ = socket.write_all(&body);
@@ -124,6 +129,80 @@ fn parsed(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+#[test]
+fn duckduckgo_header_profile_recovers_organic_results_without_changing_document_requests() {
+    let server = Fixture::request(|path, request| {
+        let request = request.to_ascii_lowercase();
+        if path.starts_with("/search?") {
+            if !request.contains("chrome/152.") {
+                return (202, "text/html", b"<title>Captcha</title>".to_vec());
+            }
+            let host = request
+                .lines()
+                .find_map(|line| line.strip_prefix("host: "))
+                .unwrap();
+            (200,"text/html",format!("<div class='result'><a class='result__a' href='http://{host}/article'>Gripper CAD</a><p class='result__snippet'>Open research evidence</p></div>").into_bytes())
+        } else if path == "/article" {
+            if !request.contains("user-agent: ffetch/") || request.contains("chrome/152.") {
+                return (
+                    400,
+                    "text/plain",
+                    b"HTTP profile leaked to document reading".to_vec(),
+                );
+            }
+            (
+                200,
+                "text/html",
+                b"<article>Gripper CAD body</article>".to_vec(),
+            )
+        } else {
+            (404, "text/plain", b"unexpected fixture request".to_vec())
+        }
+    });
+    let output = cli(&[
+        "search",
+        "gripper",
+        "--sources",
+        "web",
+        "--engines",
+        "duckduckgo",
+        "--search-mode",
+        "balanced",
+        "--read",
+        "--no-store",
+    ])
+    .env("FFETCH_WEB_SEARCH", server.url("search"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run = parsed(&output);
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    assert_eq!(run["items"][0]["title"], "Gripper CAD");
+    assert!(
+        run["items"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Gripper CAD body")
+    );
+    assert_eq!(
+        run["meta"]["coverage"][0]["meta"]["request_profile"],
+        "chrome152-user-agent-only"
+    );
+    assert_eq!(run["meta"]["http"]["requests_started"], 2);
+    assert_eq!(run["meta"]["http"]["responses_by_protocol"]["http1"], 2);
+    assert!(
+        run["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| !a["source"].as_str().unwrap().contains("browser"))
+    );
 }
 
 fn page() -> String {

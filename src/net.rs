@@ -18,6 +18,15 @@ use url::Url;
 
 tokio::task_local! { static DEADLINE: Instant; }
 
+// Header negotiation only. This does not emulate browser TLS or execute JS.
+const SEARCH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+#[derive(Clone, Copy)]
+enum HeaderProfile {
+    Standard,
+    GitHub { search: bool },
+    BrowserUserAgent,
+}
+
 /// Nested provider stages can narrow the operation deadline. The scoped future
 /// restores its context between polls, including when sources run concurrently.
 pub async fn within_budget<F: std::future::Future>(
@@ -49,6 +58,9 @@ struct Origin {
     retries: AtomicU64,
     limited: AtomicU64,
     redirects: AtomicU64,
+    http1: AtomicU64,
+    http2: AtomicU64,
+    other_protocol: AtomicU64,
 }
 
 impl Origin {
@@ -80,6 +92,7 @@ pub struct HttpStats {
     pub retries_started: u64,
     pub backoff_responses: u64,
     pub redirects_followed: u64,
+    pub responses_by_protocol: ProtocolStats,
     pub origins: Vec<OriginStats>,
 }
 
@@ -91,6 +104,16 @@ pub struct OriginStats {
     pub backoff_responses: u64,
     pub redirects_followed: u64,
     pub cooldown_remaining_ms: u64,
+    pub responses_by_protocol: ProtocolStats,
+}
+
+/// Negotiated responses received by this client. A proxy may use a different
+/// protocol upstream; these counters do not claim completed response bodies.
+#[derive(Serialize, Default)]
+pub struct ProtocolStats {
+    pub http1: u64,
+    pub http2: u64,
+    pub other: u64,
 }
 
 fn http_date(
@@ -210,6 +233,9 @@ impl Http {
                     retries: AtomicU64::new(0),
                     limited: AtomicU64::new(0),
                     redirects: AtomicU64::new(0),
+                    http1: AtomicU64::new(0),
+                    http2: AtomicU64::new(0),
+                    other_protocol: AtomicU64::new(0),
                 })
             })
             .clone()
@@ -228,6 +254,11 @@ impl Http {
                 backoff_responses: state.limited.load(Ordering::Relaxed),
                 redirects_followed: state.redirects.load(Ordering::Relaxed),
                 cooldown_remaining_ms: state.remaining().as_millis().min(u64::MAX as u128) as u64,
+                responses_by_protocol: ProtocolStats {
+                    http1: state.http1.load(Ordering::Relaxed),
+                    http2: state.http2.load(Ordering::Relaxed),
+                    other: state.other_protocol.load(Ordering::Relaxed),
+                },
             })
             .collect();
         origins.sort_by(|a, b| a.origin.cmp(&b.origin));
@@ -238,6 +269,11 @@ impl Http {
             retries_started: origins.iter().map(|o| o.retries_started).sum(),
             backoff_responses: origins.iter().map(|o| o.backoff_responses).sum(),
             redirects_followed: origins.iter().map(|o| o.redirects_followed).sum(),
+            responses_by_protocol: ProtocolStats {
+                http1: origins.iter().map(|o| o.responses_by_protocol.http1).sum(),
+                http2: origins.iter().map(|o| o.responses_by_protocol.http2).sum(),
+                other: origins.iter().map(|o| o.responses_by_protocol.other).sum(),
+            },
             origins,
         }
     }
@@ -307,17 +343,18 @@ impl Http {
                 "GitHub bearer credentials require the official HTTPS API origin"
             );
         }
-        self.get_profile(
-            url,
-            token,
-            true,
-            Some(if search {
-                "application/vnd.github.text-match+json"
-            } else {
-                "application/vnd.github+json"
-            }),
-        )
-        .await
+        self.get_profile(url, token, true, HeaderProfile::GitHub { search })
+            .await
+    }
+    /// A browser User-Agent on this origin, retaining the same TLS, connection
+    /// pool, bounds and cooldowns. This never starts a browser process.
+    pub async fn get_with_browser_user_agent(
+        &self,
+        url: Url,
+        allow_retry: bool,
+    ) -> Result<Response> {
+        self.get_profile(url, None, allow_retry, HeaderProfile::BrowserUserAgent)
+            .await
     }
     async fn get_authorized(
         &self,
@@ -325,14 +362,15 @@ impl Http {
         token: Option<&str>,
         allow_retry: bool,
     ) -> Result<Response> {
-        self.get_profile(url, token, allow_retry, None).await
+        self.get_profile(url, token, allow_retry, HeaderProfile::Standard)
+            .await
     }
     async fn get_profile(
         &self,
         url: Url,
         token: Option<&str>,
         allow_retry: bool,
-        accept: Option<&'static str>,
+        profile: HeaderProfile,
     ) -> Result<Response> {
         let own = Instant::now()
             .checked_add(self.timeout)
@@ -342,7 +380,7 @@ impl Http {
         let mut last_status = None;
         let result = tokio::time::timeout_at(
             deadline,
-            self.get_loop(url, token, deadline, allow_retry, &mut last_status, accept),
+            self.get_loop(url, token, deadline, allow_retry, &mut last_status, profile),
         )
         .await;
         // Let the enclosing timeout cancel unfinished work at its deadline.
@@ -368,7 +406,7 @@ impl Http {
         deadline: Instant,
         allow_retry: bool,
         last_status: &mut Option<StatusCode>,
-        mut accept: Option<&'static str>,
+        mut profile: HeaderProfile,
     ) -> Result<Response> {
         let mut redirects = 0;
         let mut retried = false;
@@ -384,10 +422,23 @@ impl Http {
             let origin = self.origin(&url);
             let (_local, _global) = self.acquire(&origin, deadline).await?;
             let mut request = self.client.get(url.clone());
-            if let Some(accept) = accept {
-                request = request
-                    .header("Accept", accept)
-                    .header("X-GitHub-Api-Version", "2022-11-28");
+            match profile {
+                HeaderProfile::Standard => (),
+                HeaderProfile::BrowserUserAgent => {
+                    request = request.header("User-Agent", SEARCH_USER_AGENT)
+                }
+                HeaderProfile::GitHub { search } => {
+                    request = request
+                        .header(
+                            "Accept",
+                            if search {
+                                "application/vnd.github.text-match+json"
+                            } else {
+                                "application/vnd.github+json"
+                            },
+                        )
+                        .header("X-GitHub-Api-Version", "2022-11-28");
+                }
             }
             if let Some(token) = token {
                 request = request.bearer_auth(token);
@@ -402,6 +453,14 @@ impl Http {
                 .await
                 .map_err(|e| anyhow::anyhow!("request failed: {}", e.without_url()))?;
             let status = response.status();
+            match response.version() {
+                reqwest::Version::HTTP_09
+                | reqwest::Version::HTTP_10
+                | reqwest::Version::HTTP_11 => &origin.http1,
+                reqwest::Version::HTTP_2 => &origin.http2,
+                _ => &origin.other_protocol,
+            }
+            .fetch_add(1, Ordering::Relaxed);
             *last_status = Some(status);
             let delay = response
                 .headers()
@@ -447,7 +506,7 @@ impl Http {
                 );
                 if url.origin() != next.origin() {
                     token = None;
-                    accept = None;
+                    profile = HeaderProfile::Standard;
                 }
                 if let Some(delay) = delay {
                     // Retry-After on 3xx delays this redirect, not unrelated work at
@@ -537,6 +596,99 @@ impl Http {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn browser_user_agent_shares_retry_limits_and_does_not_change_regular_requests() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+        let task = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = server.accept().unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert_eq!(request.contains("chrome/152."), index < 2);
+                assert_eq!(request.contains("user-agent: ffetch/"), index == 2);
+                assert!(!request.contains("authorization:"));
+                assert!(!request.contains("x-github-api-version:"));
+                let response = if index == 0 {
+                    "HTTP/1.1 429 Limited\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let http = Http::new(Duration::from_secs(2), 4096, 1).unwrap();
+        http.get_with_browser_user_agent(url.clone(), true)
+            .await
+            .unwrap();
+        http.get(url).await.unwrap();
+        let stats = http.stats();
+        assert_eq!(stats.requests_started, 3);
+        assert_eq!(stats.retries_started, 1);
+        assert_eq!(stats.responses_by_protocol.http1, 3);
+        assert_eq!(stats.origins[0].responses_by_protocol.http1, 3);
+        task.join().unwrap();
+    }
+    #[tokio::test]
+    async fn browser_user_agent_is_retained_on_same_origin_and_reset_on_cross_origin_redirects() {
+        use std::io::{Read, Write};
+        fn headers(socket: &mut std::net::TcpStream) -> String {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).unwrap();
+                assert!(n > 0 && data.len() + n < 64 * 1024);
+                data.extend_from_slice(&bytes[..n]);
+            }
+            String::from_utf8(data).unwrap().to_ascii_lowercase()
+        }
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/start", source.local_addr().unwrap())).unwrap();
+        let destination = format!("http://{}/final", target.local_addr().unwrap());
+        let sender = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut socket, _) = source.accept().unwrap();
+                let request = headers(&mut socket);
+                assert!(request.contains("chrome/152."));
+                assert!(!request.contains("authorization:"));
+                let location = if index == 0 { "/same" } else { &destination };
+                write!(socket,"HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            let (mut socket, _) = target.accept().unwrap();
+            let request = headers(&mut socket);
+            assert!(request.contains("user-agent: ffetch/"));
+            assert!(!request.contains("chrome/152."));
+            assert!(!request.contains("x-github-api-version:"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let http = Http::new(Duration::from_secs(3), 4096, 2).unwrap();
+        assert_eq!(
+            http.get_with_browser_user_agent(url, false)
+                .await
+                .unwrap()
+                .bytes,
+            b"ok"
+        );
+        sender.join().unwrap();
+        receiver.join().unwrap();
+        assert_eq!(http.stats().redirects_followed, 2);
+        assert_eq!(http.stats().responses_by_protocol.http1, 3);
+    }
     #[tokio::test]
     async fn github_requests_pin_the_api_and_select_text_match_media_only_for_search() {
         use std::io::{Read, Write};
