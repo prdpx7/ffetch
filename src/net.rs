@@ -16,6 +16,10 @@ use tokio::{
 };
 use url::Url;
 
+#[cfg(test)]
+#[path = "net_http2_tests.rs"]
+mod http2_tests;
+
 tokio::task_local! { static DEADLINE: Instant; }
 
 // Header negotiation only. This does not emulate browser TLS or execute JS.

@@ -122,6 +122,11 @@ other CLI processes use separate state.
 or another negotiated protocol. A body can still fail after its headers arrive.
 These are client-side observations; a proxy can use another protocol upstream.
 
+HTTPS negotiates HTTP/2 when the server supports it, with HTTP/1.1 fallback.
+Concurrent requests to one origin can share a TLS connection. The same request,
+deadline, retry, and decoded body limits apply to both protocols. HTTP/2 reduces
+connection setup in this case; it does not guarantee lower latency on every site.
+
 ## Research sources
 
 ```sh
